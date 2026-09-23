@@ -3100,7 +3100,15 @@ function ShowPill.new(gui, onRestore)
     -- for something this small, which native dragging cannot do.
     self.root.Active = true
 
-    local hit = Build.hitbox(self.root, { zindex = 40 })
+    -- Invisible grab area, ~14px wider and ~12px taller than the visible pill
+    -- on every side, so it is easy to catch with a mouse or a finger. The
+    -- click-vs-drag detection below keeps a sloppy press from moving it, and
+    -- dragging is clamped to the viewport, so it can never be flung offscreen.
+    local hit = Build.hitbox(self.root, {
+        size = UDim2.new(1, 28, 1, 24),
+        position = UDim2.fromOffset(-14, -12),
+        zindex = 40,
+    })
     hit.Active = true
     hit.AutoButtonColor = false
     self.hit = hit
@@ -4839,39 +4847,52 @@ function Window:buildTrafficLights()
     for _, spec in ipairs(specs) do
         local colour = TRAFFIC_COLOURS[spec.key]
 
+        -- The visible circle is 12px, but the button behind it is a 20px tap
+        -- target so the dots stay usable on touch screens (and forgiving on
+        -- desktop). The animations run on the inner circle, not the hitbox.
         local dot = Build.button(cluster, {
             name = "Dot_" .. spec.key,
-            size = UDim2.fromOffset(12, 12),
+            size = UDim2.fromOffset(20, 20),
             position = UDim2.fromOffset(spec.x + 6, 6),
             anchor = Vector2.new(0.5, 0.5),
-            transparency = 0,
+            transparency = 1,
             zindex = 13,
         })
-        dot.BackgroundColor3 = colour
-        Build.corner(dot, 6)
+        dot.BackgroundTransparency = 1
+
+        local circle = Build.frame(dot, {
+            name = "Circle",
+            size = UDim2.fromOffset(12, 12),
+            position = UDim2.fromScale(0.5, 0.5),
+            anchor = Vector2.new(0.5, 0.5),
+            transparency = 0,
+            zindex = 14,
+        })
+        circle.BackgroundColor3 = colour
+        Build.corner(circle, 6)
         -- Faint darker rim, like the reference art.
-        Build.stroke(dot, Color3.new(0, 0, 0), 1, 0.78)
+        Build.stroke(circle, Color3.new(0, 0, 0), 1, 0.78)
 
         -- Hover: the dot springs larger; no symbols or toasts here -- the
         -- settings toggle announces what each colour does when switched.
         dot.MouseEnter:Connect(function()
-            Anim.tween(dot, 0.18, {
+            Anim.tween(circle, 0.18, {
                 Size = UDim2.fromOffset(14, 14),
                 BackgroundColor3 = shiftColor(colour, 0.14),
             }, Anim.Ease.spring)
         end)
         dot.MouseLeave:Connect(function()
-            Anim.tween(dot, 0.26, {
+            Anim.tween(circle, 0.26, {
                 Size = UDim2.fromOffset(12, 12),
                 BackgroundColor3 = colour,
             }, Anim.Ease.spring)
         end)
         dot.MouseButton1Down:Connect(function()
-            Anim.tween(dot, 0.09, { Size = UDim2.fromOffset(10, 10) }, Anim.Ease.gentle)
+            Anim.tween(circle, 0.09, { Size = UDim2.fromOffset(10, 10) }, Anim.Ease.gentle)
         end)
         dot.MouseButton1Up:Connect(function()
             -- Pointer is still on the dot, so spring back to the hover size.
-            Anim.tween(dot, 0.24, { Size = UDim2.fromOffset(14, 14) }, Anim.Ease.spring)
+            Anim.tween(circle, 0.24, { Size = UDim2.fromOffset(14, 14) }, Anim.Ease.spring)
         end)
         dot.MouseButton1Click:Connect(function()
             if spec.onClick then task.spawn(spec.onClick) end
@@ -4894,11 +4915,14 @@ function Window:setTrafficLights(enabled, instant)
             for _, child in ipairs(self.trafficDots:GetChildren()) do
                 if child.Name:sub(1, 4) == "Dot_" then
                     index = index + 1
-                    child.Size = UDim2.fromOffset(2, 2)
-                    local target = child
-                    task.delay(index * 0.05, function()
-                        Anim.tween(target, 0.32, { Size = UDim2.fromOffset(12, 12) }, Anim.Ease.spring)
-                    end)
+                    local circle = child:FindFirstChild("Circle")
+                    if circle then
+                        circle.Size = UDim2.fromOffset(2, 2)
+                        local target = circle
+                        task.delay(index * 0.05, function()
+                            Anim.tween(target, 0.32, { Size = UDim2.fromOffset(12, 12) }, Anim.Ease.spring)
+                        end)
+                    end
                 end
             end
         end
