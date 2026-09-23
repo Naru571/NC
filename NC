@@ -2,7 +2,7 @@
     ███╗   ██╗ ██████╗
     ████╗  ██║██╔════╝   NC  —  client-side interface library
     ██╔██╗ ██║██║        premium purple aesthetic
-    ██║╚██╗██║██║        Gen 1.0.0
+    ██║╚██╗██║██║        Gen 1.1.0  —  macOS traffic lights + settings refresh
     ██║ ╚████║╚██████╗
     ╚═╝  ╚═══╝ ╚═════╝
 
@@ -97,6 +97,11 @@ Glyph.data = {
     hash     = { { "d", 9, 4, 7.5, 20 }, { "d", 16.5, 4, 15, 20 }, { "d", 4, 9, 20, 9 }, { "d", 4, 15.5, 20, 15.5 } },
     plus     = { { "d", 12, 5, 12, 19 }, { "d", 5, 12, 19, 12 } },
     minus    = { { "d", 5, 12, 19, 12 } },
+    -- Diagonal out-arrows for the expand / zoom control plate.
+    expand   = {
+        { "d", 9.6, 14.4, 4.6, 19.4 }, { "d", 4.6, 14.8, 4.6, 19.4 }, { "d", 4.6, 19.4, 9.2, 19.4 },
+        { "d", 14.4, 9.6, 19.4, 4.6 }, { "d", 14.8, 4.6, 19.4, 4.6 }, { "d", 19.4, 4.6, 19.4, 9.2 },
+    },
 
     eye = {
         { "d", 2.5, 12, 7, 7.4 }, { "d", 7, 7.4, 12, 5.6 }, { "d", 12, 5.6, 17, 7.4 },
@@ -401,30 +406,74 @@ end
 
 -- Recolour every live glyph when the accent changes, so icons stay in step
 -- with the theme without needing a rebuild.
-function Glyph.recolour()
+--
+-- Painting the whole registry in one pass hitches the frame on big interfaces
+-- (the "fps drop when I change the colour" problem). Instead an accent change
+-- snapshots the registry into a work list (queueRecolour) and the window's
+-- RenderStepped loop paints a slice of it each frame (recolourStep) until it
+-- drains -- a few cheap frames instead of one long stall.
+
+local function paintGlyph(frame)
+    -- Restore each glyph's own colour rather than forcing Theme.Text, which
+    -- wiped out accent-tinted and error-red icons on every theme change.
+    -- glyphBaseColor re-resolves a themed role against the live Theme, so
+    -- accent icons follow the accent instead of freezing on whatever was
+    -- active when they were built.
+    local base = glyphBaseColor(frame)
+    for _, child in ipairs(frame:GetChildren()) do
+        if child.Name == "Seg" then
+            child.BackgroundColor3 = base
+        elseif child.Name == "Bead" then
+            child.BackgroundColor3 = Theme.AccentSoft
+        elseif child.Name == "Ring" then
+            local stroke = child:FindFirstChildOfClass("UIStroke")
+            if stroke then stroke.Color = base end
+        end
+    end
+end
+
+local glyphWork, glyphWorkIndex, glyphWorkCount = nil, 1, 0
+
+function Glyph.queueRecolour()
+    local work = {}
+    for _, frame in ipairs(Glyph.registry) do
+        if frame and frame.Parent then
+            table.insert(work, frame)
+        end
+    end
+    -- Prune dead frames so the registry stays honest.
     for index = #Glyph.registry, 1, -1 do
         local frame = Glyph.registry[index]
         if not frame or not frame.Parent then
             table.remove(Glyph.registry, index)
-        else
-            -- Restore each glyph's own colour rather than forcing Theme.Text,
-            -- which wiped out accent-tinted and error-red icons on every theme
-            -- change. glyphBaseColor re-resolves a themed role against the live
-            -- Theme, so accent icons follow the accent instead of freezing on
-            -- whatever was active when they were built.
-            local base = glyphBaseColor(frame)
-            for _, child in ipairs(frame:GetChildren()) do
-                if child.Name == "Seg" then
-                    child.BackgroundColor3 = base
-                elseif child.Name == "Bead" then
-                    child.BackgroundColor3 = Theme.AccentSoft
-                elseif child.Name == "Ring" then
-                    local stroke = child:FindFirstChildOfClass("UIStroke")
-                    if stroke then stroke.Color = base end
-                end
-            end
         end
     end
+    glyphWork = work
+    glyphWorkIndex = 1
+    glyphWorkCount = #work
+end
+
+-- Paints at most `limit` glyphs; returns true once the work list is drained.
+function Glyph.recolourStep(limit)
+    if not glyphWork then return true end
+    limit = limit or 80
+    local last = math.min(glyphWorkCount, glyphWorkIndex + limit - 1)
+    while glyphWorkIndex <= last do
+        local frame = glyphWork[glyphWorkIndex]
+        glyphWorkIndex = glyphWorkIndex + 1
+        if frame and frame.Parent then paintGlyph(frame) end
+    end
+    if glyphWorkIndex > glyphWorkCount then
+        glyphWork = nil
+        return true
+    end
+    return false
+end
+
+-- Kept for compatibility / one-shot callers: a full immediate repaint.
+function Glyph.recolour()
+    Glyph.queueRecolour()
+    while not Glyph.recolourStep(1000000) do end
 end
 
 -- Returns a glyph name guaranteed to exist in Glyph.data. Callers used to pass
@@ -538,9 +587,6 @@ Theme = {
     -- once moved it stayed where it was dropped -- which read as the pill
     -- teleporting. Turn on with Settings > Behaviour > "Move the Show NC pill".
     PillDraggable       = false,
-    -- macOS-style traffic lights in the header: red closes, yellow minimises,
-    -- green zooms. On by default; turn off in Settings > Behaviour.
-    TrafficLights       = true,
 }
 
 local UI_SCALE_CONTAINER = nil
@@ -1065,6 +1111,7 @@ State.WindowIcon    = nil      -- resolved asset string, or nil for the NC mark
 State.IconOnly      = false    -- hide the wordmark, keep just the icon
 State.ShowText      = true     -- "Show NC" label on the floating pill
 State.ProfileHidden = false    -- profile panel collapsed via the eye toggle
+State.TrafficLights = true     -- macOS-style red/yellow/green window dots
 
 local function addConnection(conn)
     table.insert(State.Connections, conn)
@@ -1190,7 +1237,7 @@ function LIBRARY:snapshot()
         notifyCap   = Theme.NotifyCap,
         perGameConfigs = Theme.PerGameConfigs ~= false,
         pillDraggable  = Theme.PillDraggable == true,
-        trafficLights  = Theme.TrafficLights ~= false,
+        trafficLights  = State.TrafficLights ~= false,
     }
 
     return data
@@ -1257,9 +1304,6 @@ function LIBRARY:applySnapshot(data)
             LIBRARY:setPillDraggable(appearance.pillDraggable, true)
         end
         if appearance.trafficLights ~= nil then
-            -- Safe before the window exists: setTrafficLights only records the
-            -- value on Theme when there is nothing built yet, and the header
-            -- reads it back when it is created.
             LIBRARY:setTrafficLights(appearance.trafficLights, true)
         end
         if appearance.profileHidden ~= nil then LIBRARY:setProfileVisible(not appearance.profileHidden, true) end
@@ -1596,6 +1640,19 @@ function LIBRARY:setShowPillMode(showText, silent)
     if not silent then LIBRARY:queueAutoSave() end
 end
 
+-- Shows or hides the macOS-style traffic lights in the window header.
+-- Red closes, yellow minimises, green zooms. When the dots are on, the old
+-- minimise/close plates on the right are hidden so the header never offers
+-- the same action twice.
+function LIBRARY:setTrafficLights(enabled, silent)
+    State.TrafficLights = enabled ~= false
+    local window = State.Window
+    if window and window.setTrafficLights then
+        window:setTrafficLights(State.TrafficLights)
+    end
+    if not silent then LIBRARY:queueAutoSave() end
+end
+
 -- Shows or hides the bottom-left profile block.
 function LIBRARY:setProfileVisible(visible, silent)
     State.ProfileHidden = not visible
@@ -1629,6 +1686,11 @@ local function normaliseAsset(input)
 end
 
 -- The NC mark, drawn as strokes so the library never depends on an asset.
+-- Every stroke is tagged with a BrandRole attribute ("base" for the N,
+-- "accent" for the C and beads) so repaintBrandMarks can re-colour live marks
+-- when the accent changes instead of freezing them on the boot colour.
+local BRAND_HOLDERS = {}
+
 local function createBrandMark(parent, size, color)
     local holder = Build.frame(parent, {
         name = "BrandMark",
@@ -1652,6 +1714,7 @@ local function createBrandMark(parent, size, color)
         frame.BorderSizePixel = 0
         frame.ZIndex = 2
         frame.Parent = holder
+        frame:SetAttribute("BrandRole", tint and "accent" or "base")
         local c = Instance.new("UICorner")
         c.CornerRadius = UDim.new(1, 0)
         c.Parent = frame
@@ -1685,13 +1748,37 @@ local function createBrandMark(parent, size, color)
         dot.BorderSizePixel = 0
         dot.ZIndex = 3
         dot.Parent = holder
+        dot:SetAttribute("BrandRole", "accent")
         local c = Instance.new("UICorner")
         c.CornerRadius = UDim.new(1, 0)
         c.Parent = dot
     end
 
+    table.insert(BRAND_HOLDERS, holder)
     return holder
 end
+
+-- Repaints every live NC mark so the logo follows the accent chosen in
+-- Settings. Dead holders (destroyed window, replaced icons) are pruned.
+local function repaintBrandMarks()
+    for index = #BRAND_HOLDERS, 1, -1 do
+        local holder = BRAND_HOLDERS[index]
+        if not holder or not holder.Parent then
+            table.remove(BRAND_HOLDERS, index)
+        else
+            for _, part in ipairs(holder:GetDescendants()) do
+                local role = part:GetAttribute("BrandRole")
+                if role == "base" then
+                    part.BackgroundColor3 = Theme.Text
+                elseif role == "accent" then
+                    part.BackgroundColor3 = Theme.AccentSoft
+                end
+            end
+        end
+    end
+end
+
+LIBRARY:onAccent(repaintBrandMarks)
 
 -- Builds the window icon. If `asset` resolves, an ImageLabel carries it and the
 -- drawn mark is hidden; otherwise the drawn mark is used. `onFallback` fires
@@ -3236,32 +3323,117 @@ local WINDOW_HEIGHT = 462
 local RAIL_WIDTH    = 168
 local HEADER_HEIGHT = 56
 
--- Size the green "zoom" dot toggles between. Kept modest so the window still
--- fits a 1366x768 viewport without the fit-scale shrinking the whole interface.
-local ZOOM_WIDTH  = 880
-local ZOOM_HEIGHT = 560
-
--- macOS-style traffic lights, drawn top-left in the header.
-local TRAFFIC_DOT       = 12
-local TRAFFIC_GAP       = 8
-local TRAFFIC_X         = 20
-local TRAFFIC_ROW_WIDTH = TRAFFIC_DOT * 3 + TRAFFIC_GAP * 2   -- 52
-
--- Where the rest of the header sits, with the dots shown and hidden. Hiding the
--- dots has to pull the icon and title back left, or the header keeps a 66px
--- hole where they used to be. Both sets are derived from the row width above so
--- they cannot drift apart if the dot size changes.
-local HEADER_COLUMNS = {
-    on  = {
-        icon = TRAFFIC_X + TRAFFIC_ROW_WIDTH + 14,   -- 86
-        text = TRAFFIC_X + TRAFFIC_ROW_WIDTH + 52,   -- 124
-        tag  = 240 + 66,
-    },
-    off = { icon = 20, text = 58, tag = 240 },
-}
-
 local Window = {}
 Window.__index = Window
+
+-- ═══════════════════════════════════════════════════════════════════════════
+--  CHUNKED REPAINT
+--
+--  A full `root:GetDescendants()` sweep with per-instance name matching is the
+--  expensive half of Window:recolour. Running it all in one frame is what made
+--  an accent change stall the game for a beat. Instead recolour() snapshots the
+--  descendant list and hands it to windowPaintChunk, which paints at most
+--  PAINT_CHUNK instances per call; the window's RenderStepped loop keeps
+--  calling it (and Glyph.recolourStep) until both work lists drain. A theme
+--  change therefore spreads over a handful of cheap frames -- visibly smooth.
+-- ═══════════════════════════════════════════════════════════════════════════
+
+local PAINT_CHUNK = 400
+
+local function paintInstance(self, inst, ctx)
+    local transparency = ctx.transparency
+    local glow = ctx.glow
+    local gradientOn = ctx.gradientOn
+    local alpha = ctx.alpha
+    local n = inst.Name or ""
+    if inst:IsA("Frame") or inst:IsA("TextButton") then
+        if n == "SettingsPanel" or n:sub(1, 6) == "Group_" or n:sub(1, 9) == "Dropdown_" then
+            inst.BackgroundColor3 = Theme.BackgroundSecondary
+        elseif n:sub(1, 8) == "Section_" then
+            inst.BackgroundColor3 = Theme.BackgroundSecondary
+            inst.BackgroundTransparency = alpha(0.45, 0.8)
+        elseif n == "Field" or n == "Track" or n == "SearchBar" or n == "Profile" then
+            inst.BackgroundColor3 = Theme.BackgroundTertiary
+            if n ~= "SearchBar" then inst.BackgroundTransparency = alpha(0.20, 0.7) end
+        elseif n == "Plate" then
+            local owner = inst.Parent and inst.Parent.Name or ""
+            inst.BackgroundColor3 = Theme.BackgroundTertiary
+            inst.BackgroundTransparency = owner:sub(1, 5) == "Ctrl_"
+                and 0.86
+                or math.clamp(0.16 + transparency * 0.35, 0, 0.82)
+        elseif n == "Fill" or n == "ProgressFill" or n == "Indicator" then
+            inst.BackgroundColor3 = Theme.Accent
+        elseif n == "Bloom" then
+            inst.BackgroundColor3 = Theme.Accent
+            inst.BackgroundTransparency = 1 - 0.10 * (0.3 + glow * 0.7)
+        elseif n == "Glow" or n == "AccentGlow" or n == "PillGlow" or n == "KnobGlow" then
+            -- These are hover/drag layers. They must start hidden and are
+            -- revealed only by their interaction handlers.
+            inst.BackgroundColor3 = Theme.Accent
+            inst.BackgroundTransparency = 1
+        end
+    elseif inst:IsA("TextLabel") or inst:IsA("TextBox") then
+        if n == "Title" or n == "ButtonLabel" or n == "Label" then
+            inst.TextColor3 = Theme.Text
+        elseif n == "Description" or n == "Sub" or n == "Handle" then
+            inst.TextColor3 = Theme.SubText
+        end
+    elseif inst:IsA("UIStroke") then
+        local parentName = inst.Parent and inst.Parent.Name or ""
+        if parentName == "SettingsPanel" or parentName:sub(1, 8) == "Section_" or parentName:sub(1, 6) == "Group_" then
+            inst.Color = Theme.Border
+        elseif parentName == "Field" or parentName == "Track" then
+            inst.Color = Theme.Border
+        elseif parentName == "Plate" then
+            inst.Color = Theme.Border
+        elseif parentName == "Indicator" then
+            inst.Color = Theme.AccentSoft
+        end
+    elseif inst:IsA("UIGradient") then
+        local parentName = inst.Parent and inst.Parent.Name or ""
+        if parentName == "Body" then
+            inst.Color = seq(shiftColor(Theme.Accent, -0.90), Theme.Background, shiftColor(Theme.Accent, -0.94))
+            inst.Enabled = gradientOn
+        elseif parentName == "Fill" or parentName:sub(1, 4) == "Tab_" then
+            inst.Color = seq(Theme.Accent, Theme.AccentSecondary)
+            inst.Enabled = gradientOn
+        elseif parentName == "Plate" then
+            inst.Color = seq(Theme.Accent, Theme.AccentSecondary)
+            inst.Enabled = false
+        elseif parentName == "SettingsPanel" then
+            inst.Enabled = gradientOn
+        end
+    elseif inst:IsA("UICorner") then
+        local parentName = inst.Parent and inst.Parent.Name or ""
+        local radius = Theme.Corner
+        if parentName == "Body" or parentName == "SettingsPanel" then
+            radius = Theme.CornerLarge
+        elseif parentName == "Knob" or parentName == "KnobGlow" or parentName == "HueCursor" then
+            radius = 999
+        elseif parentName == "Track" then
+            radius = 999
+        end
+        inst.CornerRadius = UDim.new(0, radius)
+    end
+end
+
+-- Paints the next slice of the queued descendant list. No-op when drained.
+local function windowPaintChunk(self, limit)
+    local queue = self._paintQueue
+    if not queue then return end
+    local index = self._paintIndex
+    local last = math.min(self._paintCount, index + (limit or PAINT_CHUNK) - 1)
+    local ctx = self._paintCtx
+    while index <= last do
+        paintInstance(self, queue[index], ctx)
+        index = index + 1
+    end
+    self._paintIndex = index
+    if index > self._paintCount then
+        self._paintQueue = nil
+        self._paintCtx = nil
+    end
+end
 
 function Window.new(gui, config)
     local self = setmetatable({}, Window)
@@ -3276,12 +3448,6 @@ function Window.new(gui, config)
     self._recolourQueued = false
     self._lastFitScale = nil
     self._scaleChanged = false
-
-    -- Live window size. The zoom dot changes these, and the viewport fit pass
-    -- reads them instead of the constants so a zoomed window is still fitted.
-    self.zoomed = false
-    self.windowWidth = WINDOW_WIDTH
-    self.windowHeight = WINDOW_HEIGHT
 
     ----------------------------------------------------------------------
     -- shadow + glow shell
@@ -3431,6 +3597,14 @@ function Window.new(gui, config)
         zindex = 11,
     })
     self.tagRow.BackgroundTransparency = 1
+
+    ----------------------------------------------------------------------
+    -- macOS-style traffic lights (red close / yellow minimise / green zoom)
+    --
+    -- Built unconditionally; visibility is decided by setTrafficLights once
+    -- the right-hand controls exist, so toggling the setting never rebuilds.
+    ----------------------------------------------------------------------
+    self:buildTrafficLights()
 
     ----------------------------------------------------------------------
     -- top-right control bar
@@ -3603,12 +3777,7 @@ function Window.new(gui, config)
         -- version compared and corrected this every frame, which fought the
         -- slider while dragging and could make the window appear to teleport.
         if UI_SCALE_CONTAINER then
-            -- Fit against the window's CURRENT size, not the constants: the
-            -- green zoom dot makes the window bigger, and fitting a zoomed
-            -- window against the base size let it hang off the screen edge.
-            local liveW = self.windowWidth or WINDOW_WIDTH
-            local liveH = self.windowHeight or WINDOW_HEIGHT
-            local fitScale = math.min(parentSize.X / (liveW + 24), parentSize.Y / (liveH + 24))
+            local fitScale = math.min(parentSize.X / (WINDOW_WIDTH + 24), parentSize.Y / (WINDOW_HEIGHT + 24))
             local fitChanged = (not self._lastFitScale)
                 or math.abs(self._lastFitScale - fitScale) > 0.01
             if fitChanged or self._scaleChanged then
@@ -3618,6 +3787,8 @@ function Window.new(gui, config)
                 if math.abs(UI_SCALE_CONTAINER.Scale - wantedScale) > 0.01 then
                     UI_SCALE_CONTAINER.Scale = wantedScale
                 end
+                -- A zoomed window has to follow viewport resizes too.
+                self:refreshMaximiseSize(parentSize)
             end
         end
 
@@ -3625,6 +3796,11 @@ function Window.new(gui, config)
             self._recolourQueued = false
             self:recolour()
         end
+        -- Drain the chunked repaint work lists: a slice of the descendant
+        -- sweep plus a slice of the glyph recolour, every frame, until both
+        -- are done. This is what keeps accent changes smooth.
+        windowPaintChunk(self, PAINT_CHUNK)
+        Glyph.recolourStep(80)
 
         local absolute = self.root.AbsolutePosition
         local localX = absolute.X - parentOrigin.X
@@ -3683,14 +3859,9 @@ function Window.new(gui, config)
     ----------------------------------------------------------------------
     self:buildControls()
 
-    ----------------------------------------------------------------------
-    -- macOS-style traffic lights
-    --
-    -- Runs after buildControls: setTrafficLights parks the X and minimise
-    -- buttons, so they have to exist first. It reads Theme.TrafficLights, which
-    -- applySnapshot may already have set from a saved config.
-    ----------------------------------------------------------------------
-    self:buildTrafficLights()
+    -- Apply the traffic-light layout now that both control clusters exist.
+    -- Instant: no tween on first build.
+    self:setTrafficLights(State.TrafficLights, true)
 
     ----------------------------------------------------------------------
     -- layout listeners
@@ -3834,7 +4005,9 @@ function LIBRARY:collectPlayerInfo()
         { "platform",  "Platform",     platform },
         { "premium",   "Premium",      player.MembershipType == Enum.MembershipType.Premium and "Yes" or "No" },
         { "placeId",   "Place ID",     tostring(game.PlaceId) },
-        { "jobId",     "Server",       (game.JobId ~= "" and game.JobId:sub(1, 12) .. "...") or "Studio" },
+        -- Long values are only truncated VISUALLY by the card's labels; the
+        -- clipboard copy must stay whole, so store the full server id here.
+        { "jobId",     "Server",       game.JobId ~= "" and game.JobId or "Studio" },
     }
 
     return rows
@@ -3972,7 +4145,7 @@ function Window:buildPlayerInfo()
         end
     end)
 
-    Build.text(card, {
+    local nameLabel = Build.text(card, {
         name = "Name",
         text = Players.LocalPlayer.DisplayName,
         size = UDim2.new(1, -(PAD * 2 + 38), 0, 17),
@@ -3984,7 +4157,7 @@ function Window:buildPlayerInfo()
         truncate = Enum.TextTruncate.AtEnd,
         zindex = 622,
     })
-    Build.text(card, {
+    local handleLabel = Build.text(card, {
         name = "Handle",
         text = "@" .. Players.LocalPlayer.Name,
         size = UDim2.new(1, -(PAD * 2 + 38), 0, 14),
@@ -4178,6 +4351,7 @@ function Window:buildPlayerInfo()
 
     self.playerInfoButton = button
     self.playerInfoCard = card
+    self.closePlayerInfoCard = closeCard
     self.playerInfoParts = {
         button = button,
         buttonStroke = buttonStroke,
@@ -4185,7 +4359,21 @@ function Window:buildPlayerInfo()
         card = card,
         cardStroke = cardStroke,
         valueLabels = valueLabels,
+        copyBtn = copyBtn,
+        copyStroke = copyStroke,
+        copyLabel = copyLabel,
+        headHolder = headHolder,
+        divider = divider,
+        nameLabel = nameLabel,
+        handleLabel = handleLabel,
     }
+
+    -- The button is part of the same player block as the profile panel: if
+    -- the profile is hidden (eye toggle or restored config), start hidden.
+    if self.profileHidden then
+        button.Visible = false
+    end
+
     return button
 end
 
@@ -4353,6 +4541,13 @@ function Window:buildProfile()
     }
     self.profileHidden = false
 
+    -- A config restored before the window existed only updated State (there
+    -- was no window to talk to); apply it now so a saved "profile hidden"
+    -- survives a reload.
+    if State.ProfileHidden then
+        self:setProfileVisible(false, true)
+    end
+
     table.insert(self.connections, eyeHit.MouseButton1Click:Connect(function()
         self:setProfileVisible(self.profileHidden)
         LIBRARY:queueAutoSave()
@@ -4372,6 +4567,16 @@ function Window:setProfileVisible(visible, silent)
     if not parts then return end
     self.profileHidden = not visible
     State.ProfileHidden = self.profileHidden
+
+    -- The info button and its card belong to the same player block: hiding
+    -- the profile tucks them away too, so no personal info stays on screen
+    -- (and an open card cannot outlive the hide).
+    if self.playerInfoButton then
+        self.playerInfoButton.Visible = visible
+    end
+    if not visible and self.closePlayerInfoCard then
+        self.closePlayerInfoCard()
+    end
 
     -- swap the eye glyph
     if parts.eyeGlyph and parts.eyeGlyph.Parent then
@@ -4435,292 +4640,6 @@ end
     colour; press scales down and release springs back. `onClick` receives the
     press only when the icon was actually tapped, never after a drag.
 ]]
--- ═══════════════════════════════════════════════════════════════════════════
---  TRAFFIC LIGHTS
---
---  The three dots macOS puts top-left, drawn from primitives like every other
---  icon here: red closes, yellow minimises, green zooms.
---
---  While they are on, the X and minimise buttons in the top-right control bar
---  are parked off-screen -- they would be a second, redundant way to do the
---  same two jobs, and the control bar reads cleaner as search + settings only.
---  Turning the dots off in Settings brings them straight back.
--- ═══════════════════════════════════════════════════════════════════════════
-
-local TRAFFIC_SPECS = {
-    { name = "Close",    color = Color3.fromRGB(255, 95, 87)  },   -- macOS red
-    { name = "Minimise", color = Color3.fromRGB(254, 188, 46) },   -- macOS amber
-    { name = "Zoom",     color = Color3.fromRGB(40, 200, 64)  },   -- macOS green
-}
-
-function Window:buildTrafficLights()
-    if self.trafficRow then return self.trafficRow end
-
-    local row = Build.frame(self.header, {
-        name = "TrafficLights",
-        size = UDim2.fromOffset(TRAFFIC_ROW_WIDTH, TRAFFIC_DOT),
-        position = UDim2.new(0, TRAFFIC_X, 0.5, 0),
-        anchor = Vector2.new(0, 0.5),
-        transparency = 1,
-        zindex = 14,
-    })
-    row.BackgroundTransparency = 1
-    self.trafficRow = row
-    self.trafficDots = {}
-
-    local layout = Instance.new("UIListLayout")
-    layout.FillDirection = Enum.FillDirection.Horizontal
-    layout.SortOrder = Enum.SortOrder.LayoutOrder
-    layout.VerticalAlignment = Enum.VerticalAlignment.Center
-    layout.Padding = UDim.new(0, TRAFFIC_GAP)
-    layout.Parent = row
-
-    for index, spec in ipairs(TRAFFIC_SPECS) do
-        -- Plain frames, not buttons: one hitbox over the whole row owns all the
-        -- input. Three separate click targets left 8px dead gaps between them,
-        -- so dragging across the row flickered the glyphs on and off.
-        local dot = Build.frame(row, {
-            name = "Dot_" .. spec.name,
-            size = UDim2.fromOffset(TRAFFIC_DOT, TRAFFIC_DOT),
-            transparency = 1,
-            zindex = 15,
-        })
-        dot.BackgroundColor3 = spec.color
-        dot.BackgroundTransparency = 0
-        Build.corner(dot, 999)
-        dot.LayoutOrder = index
-
-        -- Soft bloom behind the dot, lit on hover. Starts fully transparent.
-        local halo = Build.frame(dot, {
-            name = "Halo",
-            size = UDim2.fromScale(1.9, 1.9),
-            position = UDim2.fromScale(0.5, 0.5),
-            anchor = Vector2.new(0.5, 0.5),
-            transparency = 1,
-            zindex = 13,
-        })
-        halo.BackgroundColor3 = spec.color
-        halo.BackgroundTransparency = 1
-        Build.corner(halo, 999)
-
-        -- The mark inside the dot. macOS hides these until you hover the row,
-        -- so every bar starts fully transparent and is tweened in on hover.
-        local glyphHolder = Build.frame(dot, {
-            name = "Glyph",
-            size = UDim2.fromScale(1, 1),
-            transparency = 1,
-            zindex = 17,
-        })
-        glyphHolder.BackgroundTransparency = 1
-
-        local bars = {}
-        local function bar(w, h, rotation)
-            local b = Build.frame(glyphHolder, {
-                name = "Bar",
-                size = UDim2.fromOffset(w, h),
-                position = UDim2.fromScale(0.5, 0.5),
-                anchor = Vector2.new(0.5, 0.5),
-                transparency = 1,
-                zindex = 18,
-            })
-            -- A darkened version of the dot's own colour, which is what macOS
-            -- uses -- near-black marks read as holes punched in the dot.
-            b.BackgroundColor3 = shiftColor(spec.color, -0.62)
-            b.BackgroundTransparency = 1
-            b.Rotation = rotation
-            Build.corner(b, math.max(w, h))
-            table.insert(bars, b)
-            return b
-        end
-
-        local len, thick = 6.4, 1.5
-        if spec.name == "Close" then
-            bar(len, thick, 45)
-            bar(len, thick, -45)
-        elseif spec.name == "Minimise" then
-            bar(len, thick, 0)
-        else
-            -- macOS used a "+" for zoom for years before the two triangles.
-            bar(len, thick, 0)
-            bar(thick, len, 0)
-        end
-
-        self.trafficDots[index] = {
-            spec = spec,
-            dot = dot,
-            halo = halo,
-            bars = bars,
-        }
-    end
-
-    ------------------------------------------------------------------
-    -- one hitbox owns the whole row
-    ------------------------------------------------------------------
-    local hit = Build.hitbox(row, { zindex = 20 })
-    local hovered = 0
-
-    -- Dots sit on a 20px pitch (12px dot + 8px gap).
-    local pitch = TRAFFIC_DOT + TRAFFIC_GAP
-    local function indexAt(x)
-        if type(x) ~= "number" then return hovered end
-        return math.clamp(math.floor(x / pitch) + 1, 1, #self.trafficDots)
-    end
-
-    local function paint(index, lit)
-        for i, entry in ipairs(self.trafficDots) do
-            local want = (i == index and lit) and shiftColor(entry.spec.color, 0.20)
-                or entry.spec.color
-            Anim.tween(entry.dot, 0.14, { BackgroundColor3 = want }, Anim.Ease.gentle)
-            Anim.tween(entry.halo, 0.18, {
-                BackgroundTransparency = (i == index and lit) and 0.72 or 1,
-            }, Anim.Ease.gentle)
-        end
-    end
-
-    local function showGlyphs(visible)
-        for _, entry in ipairs(self.trafficDots) do
-            for _, b in ipairs(entry.bars) do
-                Anim.tween(b, 0.15, {
-                    BackgroundTransparency = visible and 0.15 or 1,
-                }, Anim.Ease.gentle)
-            end
-        end
-    end
-
-    table.insert(self.connections, hit.MouseEnter:Connect(function()
-        showGlyphs(true)
-    end))
-
-    table.insert(self.connections, hit.MouseLeave:Connect(function()
-        showGlyphs(false)
-        hovered = 0
-        paint(0, false)
-    end))
-
-    table.insert(self.connections, hit.MouseMoved:Connect(function(x)
-        local index = indexAt(x)
-        if index ~= hovered then
-            hovered = index
-            paint(index, true)
-        end
-    end))
-
-    table.insert(self.connections, hit.MouseButton1Down:Connect(function(x)
-        hovered = indexAt(x)
-        local entry = self.trafficDots[hovered]
-        if entry then
-            Anim.tween(entry.dot, 0.08, {
-                BackgroundColor3 = shiftColor(entry.spec.color, -0.32),
-            }, Anim.Ease.gentle)
-        end
-    end))
-
-    table.insert(self.connections, hit.MouseButton1Up:Connect(function()
-        paint(hovered, true)
-    end))
-
-    table.insert(self.connections, hit.MouseButton1Click:Connect(function()
-        local entry = self.trafficDots[hovered]
-        if not entry then return end
-        local name = entry.spec.name
-        if name == "Close" then
-            self:requestClose()
-        elseif name == "Minimise" then
-            self:minimise()
-        elseif name == "Zoom" then
-            self:setZoomed(not self.zoomed)
-        end
-    end))
-
-    -- Honour whatever Theme says right now, so a config restored before the
-    -- window existed is respected on first paint rather than after a flash.
-    self:setTrafficLights(Theme.TrafficLights ~= false, true)
-
-    return row
-end
-
--- Slides the header content left or right to make room for the dots.
-function Window:applyTrafficLightLayout(enabled)
-    local cols = enabled and HEADER_COLUMNS.on or HEADER_COLUMNS.off
-    local speed = 0.34
-
-    if self.iconHost then
-        Anim.tween(self.iconHost, speed,
-            { Position = UDim2.new(0, cols.icon, 0.5, 0) }, Anim.Ease.spring)
-    end
-    if self.title then
-        Anim.tween(self.title, speed,
-            { Position = UDim2.new(0, cols.text, 0, 17) }, Anim.Ease.spring)
-    end
-    if self.subtitle then
-        Anim.tween(self.subtitle, speed,
-            { Position = UDim2.new(0, cols.text, 0, 34) }, Anim.Ease.spring)
-    end
-    if self.tagRow then
-        Anim.tween(self.tagRow, speed,
-            { Position = UDim2.new(0, cols.tag, 0, 0) }, Anim.Ease.spring)
-    end
-end
-
--- Parks the redundant X / minimise buttons while the dots are on.
---
--- They are reparented to an off-screen holder as well as hidden: a
--- `Visible = false` child still occupies its slot in a UIListLayout, so simply
--- hiding them would leave a two-button gap in the control bar. This is the same
--- trick the notification cap uses for overflow cards.
-function Window:parkControlButtons(park)
-    if not self.controlPark then
-        self.controlPark = Build.frame(self.header, {
-            name = "ControlPark",
-            size = UDim2.fromOffset(160, 30),
-            position = UDim2.new(0, -500, 0.5, 0),
-            transparency = 1,
-            zindex = 1,
-        })
-        self.controlPark.BackgroundTransparency = 1
-    end
-
-    local home = park and self.controlPark or self.controls
-    for _, button in ipairs({ self.minimiseButton, self.closeButton }) do
-        if button and button.holder then
-            button.holder.Parent = home
-            button.holder.Visible = not park
-        end
-    end
-end
-
-function Window:setTrafficLights(enabled, silent)
-    enabled = enabled and true or false
-    Theme.TrafficLights = enabled
-
-    if self.trafficRow then
-        self.trafficRow.Visible = enabled
-    end
-
-    self:applyTrafficLightLayout(enabled)
-    self:parkControlButtons(enabled)
-
-    if not silent then LIBRARY:queueAutoSave() end
-end
-
--- Green dot. The rail, content, profile block and settings panel are all sized
--- from the body's scale, so they follow the root on their own.
-function Window:setZoomed(zoomed)
-    zoomed = zoomed and true or false
-    self.zoomed = zoomed
-
-    local w = zoomed and ZOOM_WIDTH or WINDOW_WIDTH
-    local h = zoomed and ZOOM_HEIGHT or WINDOW_HEIGHT
-    self.windowWidth, self.windowHeight = w, h
-
-    -- The fit-scale pass only recalculates when the viewport changes or this
-    -- flag is set. Without it, zooming on a small screen would leave the window
-    -- overflowing the screen edge until something else forced a re-check.
-    self._scaleChanged = true
-
-    Anim.tween(self.root, 0.42, { Size = UDim2.fromOffset(w, h) }, Anim.Ease.spring)
-end
-
 function Window:createControlButton(spec)
     local holder = Build.frame(self.controls, {
         name = "Ctrl_" .. (spec.name or "button"),
@@ -4851,11 +4770,19 @@ function Window:buildControls()
         onClick = function() self:toggleSettings() end,
     })
 
+    -- zoom / expand, for people running without the traffic lights
+    self.zoomButton = self:createControlButton({
+        name = "Zoom",
+        glyph = "expand",
+        order = 3,
+        onClick = function() self:toggleMaximise() end,
+    })
+
     -- minimise
     self.minimiseButton = self:createControlButton({
         name = "Minimise",
         glyph = "minimise",
-        order = 3,
+        order = 4,
         onClick = function() self:minimise() end,
     })
 
@@ -4863,7 +4790,7 @@ function Window:buildControls()
     self.closeButton = self:createControlButton({
         name = "Close",
         glyph = "close",
-        order = 4,
+        order = 5,
         accent = Theme.Error,
         hoverPlate = Theme.Error,
         onClick = function() self:requestClose() end,
@@ -4873,6 +4800,169 @@ end
 -- Close confirmation -------------------------------------------------------
 -- Closing hides the live window but does not destroy it. Require an explicit
 -- second click so an accidental tap on the X cannot dismiss the interface.
+-- ═══════════════════════════════════════════════════════════════════════════
+--  TRAFFIC LIGHTS  —  macOS-style window dots
+--
+--  Red closes (through the same confirm as the X plate), yellow minimises to
+--  the Show NC pill, green zooms the window between its normal size and a
+--  viewport-fitting size. Hovering a dot springs it larger; the settings
+--  toggle announces what each colour does when it is switched on or off.
+-- ═══════════════════════════════════════════════════════════════════════════
+
+local TRAFFIC_COLOURS = {
+    close    = Color3.fromHex("FF5F57"),
+    minimise = Color3.fromHex("FEBC2E"),
+    zoom     = Color3.fromHex("28C840"),
+}
+
+function Window:buildTrafficLights()
+    if self.trafficDots then return self.trafficDots end
+
+    local cluster = Build.frame(self.header, {
+        name = "TrafficLights",
+        -- Three 12px dots with 8px gaps.
+        size = UDim2.fromOffset(52, 12),
+        position = UDim2.new(0, 18, 0.5, 0),
+        anchor = Vector2.new(0, 0.5),
+        transparency = 1,
+        zindex = 12,
+    })
+    cluster.BackgroundTransparency = 1
+    self.trafficDots = cluster
+
+    local specs = {
+        { key = "close",    x = 0,  onClick = function() self:requestClose() end },
+        { key = "minimise", x = 20, onClick = function() self:minimise() end },
+        { key = "zoom",     x = 40, onClick = function() self:toggleMaximise() end },
+    }
+
+    for _, spec in ipairs(specs) do
+        local colour = TRAFFIC_COLOURS[spec.key]
+
+        local dot = Build.button(cluster, {
+            name = "Dot_" .. spec.key,
+            size = UDim2.fromOffset(12, 12),
+            position = UDim2.fromOffset(spec.x + 6, 6),
+            anchor = Vector2.new(0.5, 0.5),
+            transparency = 0,
+            zindex = 13,
+        })
+        dot.BackgroundColor3 = colour
+        Build.corner(dot, 6)
+        -- Faint darker rim, like the reference art.
+        Build.stroke(dot, Color3.new(0, 0, 0), 1, 0.78)
+
+        -- Hover: the dot springs larger; no symbols or toasts here -- the
+        -- settings toggle announces what each colour does when switched.
+        dot.MouseEnter:Connect(function()
+            Anim.tween(dot, 0.18, {
+                Size = UDim2.fromOffset(14, 14),
+                BackgroundColor3 = shiftColor(colour, 0.14),
+            }, Anim.Ease.spring)
+        end)
+        dot.MouseLeave:Connect(function()
+            Anim.tween(dot, 0.26, {
+                Size = UDim2.fromOffset(12, 12),
+                BackgroundColor3 = colour,
+            }, Anim.Ease.spring)
+        end)
+        dot.MouseButton1Down:Connect(function()
+            Anim.tween(dot, 0.09, { Size = UDim2.fromOffset(10, 10) }, Anim.Ease.gentle)
+        end)
+        dot.MouseButton1Up:Connect(function()
+            -- Pointer is still on the dot, so spring back to the hover size.
+            Anim.tween(dot, 0.24, { Size = UDim2.fromOffset(14, 14) }, Anim.Ease.spring)
+        end)
+        dot.MouseButton1Click:Connect(function()
+            if spec.onClick then task.spawn(spec.onClick) end
+        end)
+    end
+
+    return cluster
+end
+
+-- Window-side layout switch. `instant` skips tweens for the first build.
+function Window:setTrafficLights(enabled, instant)
+    local on = enabled and true or false
+
+    if self.trafficDots then
+        self.trafficDots.Visible = on
+        -- Staggered pop when the dots appear, so enabling the setting (or
+        -- restoring the window layout) feels deliberate rather than instant.
+        if on and not instant then
+            local index = 0
+            for _, child in ipairs(self.trafficDots:GetChildren()) do
+                if child.Name:sub(1, 4) == "Dot_" then
+                    index = index + 1
+                    child.Size = UDim2.fromOffset(2, 2)
+                    local target = child
+                    task.delay(index * 0.05, function()
+                        Anim.tween(target, 0.32, { Size = UDim2.fromOffset(12, 12) }, Anim.Ease.spring)
+                    end)
+                end
+            end
+        end
+    end
+
+    -- The dots replace the old minimise/close plates, and the green dot
+    -- covers zoom, so the expand plate follows the others.
+    if self.zoomButton and self.zoomButton.holder then
+        self.zoomButton.holder.Visible = not on
+    end
+    if self.minimiseButton and self.minimiseButton.holder then
+        self.minimiseButton.holder.Visible = not on
+    end
+    if self.closeButton and self.closeButton.holder then
+        self.closeButton.holder.Visible = not on
+    end
+
+    -- Slide the brand cluster right to make room for the dots.
+    local iconX = on and 82 or 20
+    local textX = on and 120 or 58
+    local tween = instant and function(inst, props)
+        for key, value in pairs(props) do inst[key] = value end
+    end or function(inst, props)
+        Anim.tween(inst, 0.3, props, Anim.Ease.soft)
+    end
+
+    if self.iconHost then tween(self.iconHost, { Position = UDim2.new(0, iconX, 0.5, 0) }) end
+    if self.title then tween(self.title, { Position = UDim2.new(0, textX, 0, 17) }) end
+    if self.subtitle then tween(self.subtitle, { Position = UDim2.new(0, textX, 0, 34) }) end
+end
+
+-- Green dot: grow the window to fit the viewport, or restore the default
+-- 720x462. The target is remembered so open() restores whichever size was
+-- active when the window was closed or minimised.
+function Window:toggleMaximise()
+    if not self.opened then return end
+    self.maximised = not self.maximised
+
+    local w, h = WINDOW_WIDTH, WINDOW_HEIGHT
+    if self.maximised then
+        local scale = (UI_SCALE_CONTAINER and UI_SCALE_CONTAINER.Scale) or 1
+        local parent = self.root.Parent
+        local viewport = (parent and parent.AbsoluteSize.X > 0)
+            and parent.AbsoluteSize or Vector2.new(1280, 720)
+        w = math.floor(math.max(WINDOW_WIDTH, math.min(1080, viewport.X / scale - 28)))
+        h = math.floor(math.max(WINDOW_HEIGHT, math.min(680, viewport.Y / scale - 28)))
+    end
+
+    self._targetW, self._targetH = w, h
+    Anim.tween(self.root, 0.42, { Size = UDim2.fromOffset(w, h) }, Anim.Ease.spring)
+end
+
+-- Recomputes the zoomed size after a viewport change while maximised.
+function Window:refreshMaximiseSize(viewport)
+    if not self.maximised then return end
+    local scale = (UI_SCALE_CONTAINER and UI_SCALE_CONTAINER.Scale) or 1
+    local w = math.floor(math.max(WINDOW_WIDTH, math.min(1080, viewport.X / scale - 28)))
+    local h = math.floor(math.max(WINDOW_HEIGHT, math.min(680, viewport.Y / scale - 28)))
+    if w ~= self._targetW or h ~= self._targetH then
+        self._targetW, self._targetH = w, h
+        self.root.Size = UDim2.fromOffset(w, h)
+    end
+end
+
 function Window:buildCloseConfirm()
     if self.closeConfirmPanel and self.closeConfirmPanel.Parent then
         return self.closeConfirmPanel
@@ -5081,7 +5171,11 @@ function Window:open()
 
     self.root.Visible = true
     if self.closeConfirmPanel then self.closeConfirmPanel.Visible = false end
-    self.root.Size = UDim2.fromOffset(WINDOW_WIDTH * 0.86, WINDOW_HEIGHT * 0.86)
+    -- Honour a zoomed size from the green traffic light instead of always
+    -- snapping back to the default dimensions.
+    local tw = self._targetW or WINDOW_WIDTH
+    local th = self._targetH or WINDOW_HEIGHT
+    self.root.Size = UDim2.fromOffset(tw * 0.86, th * 0.86)
     self.body.BackgroundTransparency = 1
     self.border.Transparency = 1
     self.borderGlow.Transparency = 1
@@ -5089,7 +5183,7 @@ function Window:open()
     self.bloom.BackgroundTransparency = 1
 
     Anim.tween(self.root, 0.55, {
-        Size = UDim2.fromOffset(WINDOW_WIDTH, WINDOW_HEIGHT),
+        Size = UDim2.fromOffset(tw, th),
     }, Anim.Ease.spring)
 
     Anim.tween(self.body, 0.42, {
@@ -5248,6 +5342,50 @@ function Window:recolour()
         end
     end
 
+    -- Player-info button + card used to freeze on the accent they were built
+    -- with; repaint every part of them from the live Theme.
+    if self.playerInfoParts then
+        local p = self.playerInfoParts
+        local cardOpen = p.card and p.card.Parent and p.card.Visible or false
+
+        if p.button and p.button.Parent then
+            p.button.BackgroundColor3 = Theme.BackgroundTertiary
+            p.buttonStroke.Color = cardOpen and Theme.AccentSoft or Theme.Border
+        end
+        if p.card and p.card.Parent then
+            p.card.BackgroundColor3 = Theme.BackgroundSecondary
+            p.cardStroke.Color = Theme.AccentSoft
+            if p.divider and p.divider.Parent then
+                p.divider.BackgroundColor3 = Theme.Border
+            end
+            if p.headHolder and p.headHolder.Parent then
+                p.headHolder.BackgroundColor3 = Theme.Background
+                for _, child in ipairs(p.headHolder:GetChildren()) do
+                    if child:IsA("UIStroke") then child.Color = Theme.Accent end
+                end
+            end
+            if p.nameLabel and p.nameLabel.Parent then
+                p.nameLabel.TextColor3 = Theme.Text
+            end
+            if p.handleLabel and p.handleLabel.Parent then
+                p.handleLabel.TextColor3 = Theme.SubText
+            end
+            for _, child in ipairs(p.card:GetChildren()) do
+                if child:IsA("TextLabel") and child.Name:sub(1, 2) == "L_" then
+                    child.TextColor3 = Theme.MutedText
+                end
+            end
+            for _, label in pairs(p.valueLabels or {}) do
+                if label.Parent then label.TextColor3 = Theme.Text end
+            end
+        end
+        if p.copyBtn and p.copyBtn.Parent then
+            p.copyBtn.BackgroundColor3 = Theme.Accent
+            p.copyStroke.Color = Theme.AccentSoft
+            p.copyLabel.TextColor3 = Theme.Text
+        end
+    end
+
     -- Sections, tabs, controls, popups, settings, strokes, gradients and
     -- corners all repaint from the current Theme instead of keeping the old
     -- purple/black literals that made the settings sliders appear broken.
@@ -5263,78 +5401,18 @@ function Window:recolour()
         end
     end
 
-    for _, inst in ipairs(self.root:GetDescendants()) do
-        local n = inst.Name or ""
-        if inst:IsA("Frame") or inst:IsA("TextButton") then
-            if n == "SettingsPanel" or n:sub(1, 6) == "Group_" or n:sub(1, 9) == "Dropdown_" then
-                inst.BackgroundColor3 = Theme.BackgroundSecondary
-            elseif n:sub(1, 8) == "Section_" then
-                inst.BackgroundColor3 = Theme.BackgroundSecondary
-                inst.BackgroundTransparency = alpha(0.45, 0.8)
-            elseif n == "Field" or n == "Track" or n == "SearchBar" or n == "Profile" then
-                inst.BackgroundColor3 = Theme.BackgroundTertiary
-                if n ~= "SearchBar" then inst.BackgroundTransparency = alpha(0.20, 0.7) end
-            elseif n == "Plate" then
-                local owner = inst.Parent and inst.Parent.Name or ""
-                inst.BackgroundColor3 = Theme.BackgroundTertiary
-                inst.BackgroundTransparency = owner:sub(1, 5) == "Ctrl_"
-                    and 0.86
-                    or math.clamp(0.16 + transparency * 0.35, 0, 0.82)
-            elseif n == "Fill" or n == "ProgressFill" or n == "Indicator" then
-                inst.BackgroundColor3 = Theme.Accent
-            elseif n == "Bloom" then
-                inst.BackgroundColor3 = Theme.Accent
-                inst.BackgroundTransparency = 1 - 0.10 * (0.3 + glow * 0.7)
-            elseif n == "Glow" or n == "AccentGlow" or n == "PillGlow" or n == "KnobGlow" then
-                -- These are hover/drag layers. They must start hidden and are
-                -- revealed only by their interaction handlers.
-                inst.BackgroundColor3 = Theme.Accent
-                inst.BackgroundTransparency = 1
-            end
-        elseif inst:IsA("TextLabel") or inst:IsA("TextBox") then
-            if n == "Title" or n == "ButtonLabel" or n == "Label" then
-                inst.TextColor3 = Theme.Text
-            elseif n == "Description" or n == "Sub" or n == "Handle" then
-                inst.TextColor3 = Theme.SubText
-            end
-        elseif inst:IsA("UIStroke") then
-            local parentName = inst.Parent and inst.Parent.Name or ""
-            if parentName == "SettingsPanel" or parentName:sub(1, 8) == "Section_" or parentName:sub(1, 6) == "Group_" then
-                inst.Color = Theme.Border
-            elseif parentName == "Field" or parentName == "Track" then
-                inst.Color = Theme.Border
-            elseif parentName == "Plate" then
-                inst.Color = Theme.Border
-            elseif parentName == "Indicator" then
-                inst.Color = Theme.AccentSoft
-            end
-        elseif inst:IsA("UIGradient") then
-            local parentName = inst.Parent and inst.Parent.Name or ""
-            if parentName == "Body" then
-                inst.Color = seq(shiftColor(Theme.Accent, -0.90), Theme.Background, shiftColor(Theme.Accent, -0.94))
-                inst.Enabled = gradientOn
-            elseif parentName == "Fill" or parentName:sub(1, 4) == "Tab_" then
-                inst.Color = seq(Theme.Accent, Theme.AccentSecondary)
-                inst.Enabled = gradientOn
-            elseif parentName == "Plate" then
-                inst.Color = seq(Theme.Accent, Theme.AccentSecondary)
-                inst.Enabled = false
-            elseif parentName == "SettingsPanel" then
-                inst.Enabled = gradientOn
-            end
-        elseif inst:IsA("UICorner") then
-            local parentName = inst.Parent and inst.Parent.Name or ""
-            local radius = Theme.Corner
-            if parentName == "Body" or parentName == "SettingsPanel" then
-                radius = Theme.CornerLarge
-            elseif parentName == "Knob" or parentName == "KnobGlow" or parentName == "HueCursor" then
-                radius = 999
-            elseif parentName == "Track" then
-                radius = 999
-            end
-            inst.CornerRadius = UDim.new(0, radius)
-        end
-    end
+    -- The descendant sweep runs in per-frame slices (see PAINT_CHUNK) so an
+    -- accent change never stalls a frame; the RenderStepped loop drains it.
+    self._paintQueue = self.root:GetDescendants()
+    self._paintCount = #self._paintQueue
+    self._paintIndex = 1
+    self._paintCtx = {
+        transparency = transparency,
+        glow = glow,
+        gradientOn = gradientOn,
+        alpha = alpha,
+    }
+    windowPaintChunk(self, PAINT_CHUNK)
 
     if self.settingsPanel then
         self.settingsPanel.BackgroundColor3 = Theme.BackgroundSecondary
@@ -5359,7 +5437,8 @@ function Window:recolour()
         self.closeConfirmParts.confirm.BackgroundColor3 = Theme.Error
     end
     if State.ShowPill then State.ShowPill:recolour() end
-    Glyph.recolour()
+    -- Queued, not immediate: the glyph sweep now paints in per-frame slices.
+    Glyph.queueRecolour()
 end
 
 -- ═══════════════════════════════════════════════════════════════════════════
@@ -7782,27 +7861,26 @@ function Section:CreateGroup(props)
     header.BackgroundTransparency = 1
     header.AutoButtonColor = false
 
-    -- Accent tick, so a group header reads as a heading rather than as just
-    -- another row. Without it the title sat at exactly the same indent as the
-    -- controls underneath it and the panel read as one flat list.
-    local tick = Build.frame(header, {
-        name = "GroupTick",
-        size = UDim2.fromOffset(3, 11),
-        position = UDim2.new(0, 0, 0.5, 0),
-        anchor = Vector2.new(0, 0.5),
-        transparency = 1,
-        zindex = 7,
-    })
-    tick.BackgroundColor3 = Theme.Accent
-    tick.BackgroundTransparency = 0.2
-    Build.corner(tick, 2)
-    self.tick = tick
+    -- Optional leading glyph, so settings groups read at a glance.
+    local groupIcon = props.icon or props.Icon
+    if groupIcon then
+        local iconHolder = Build.frame(header, {
+            name = "GroupIcon",
+            size = UDim2.fromOffset(16, 16),
+            position = UDim2.new(0, 0, 0.5, 0),
+            anchor = Vector2.new(0, 0.5),
+            transparency = 1,
+            zindex = 7,
+        })
+        iconHolder.BackgroundTransparency = 1
+        Glyph.new(iconHolder, Glyph.resolve(groupIcon, "sparkle"), 14, Theme.AccentSoft, 0.15, 1.6, false)
+    end
 
     Build.text(header, {
         name = "GroupTitle",
         text = self.title,
-        size = UDim2.new(1, -32, 1, 0),
-        position = UDim2.fromOffset(11, 0),
+        size = UDim2.new(1, groupIcon and -40 or -18, 1, 0),
+        position = UDim2.new(0, groupIcon and 22 or 0, 0, 0),
         font = Enum.Font.GothamBold,
         textSize = 12,
         color = Theme.SubText,
@@ -7907,7 +7985,6 @@ function Group:recolour()
     if not self.shell or not self.shell.Parent then return end
     self.shell.BackgroundColor3 = Theme.BackgroundTertiary
     self.stroke.Color = Theme.Border
-    if self.tick then self.tick.BackgroundColor3 = Theme.Accent end
 end
 
 -- ═══════════════════════════════════════════════════════════════════════════
@@ -8686,16 +8763,39 @@ function Window:buildSettings()
     ----------------------------------------------------------------------
     local head = Build.frame(scroller, {
         name = "Head",
-        size = UDim2.new(1, 0, 0, 42),
+        size = UDim2.new(1, 0, 0, 58),
         transparency = 1,
         zindex = 702,
     })
     head.BackgroundTransparency = 1
 
+    -- Accent chip carrying the settings glyph so the panel reads as a page,
+    -- not a floating list.
+    local headChip = Build.frame(head, {
+        name = "Chip",
+        size = UDim2.fromOffset(34, 34),
+        position = UDim2.fromOffset(0, 6),
+        transparency = 0,
+        zindex = 703,
+    })
+    headChip.BackgroundColor3 = Theme.Accent
+    Build.corner(headChip, 10)
+    local headChipGradient = Build.gradient(headChip, Theme.Gradient, 135)
+    local headChipStroke = Build.stroke(headChip, Theme.AccentSoft, 1, 0.5)
+    local headGlyphHolder = Build.frame(headChip, {
+        name = "Glyph",
+        size = UDim2.fromScale(1, 1),
+        transparency = 1,
+        zindex = 704,
+    })
+    headGlyphHolder.BackgroundTransparency = 1
+    Glyph.new(headGlyphHolder, "settings", 17, Theme.Text, 0, 1.7, false)
+
     Build.text(head, {
         name = "Title",
         text = "Settings",
-        size = UDim2.new(1, -30, 0, 19),
+        size = UDim2.new(1, -76, 0, 20),
+        position = UDim2.fromOffset(44, 7),
         font = Enum.Font.GothamBold,
         textSize = 16,
         color = Theme.Text,
@@ -8704,9 +8804,9 @@ function Window:buildSettings()
     })
     Build.text(head, {
         name = "Sub",
-        text = "Appearance, configs and behaviour",
-        size = UDim2.new(1, -30, 0, 14),
-        position = UDim2.fromOffset(0, 20),
+        text = "Appearance, window and configs",
+        size = UDim2.new(1, -76, 0, 14),
+        position = UDim2.fromOffset(44, 27),
         font = Enum.Font.Gotham,
         textSize = 11,
         color = Theme.MutedText,
@@ -8714,34 +8814,66 @@ function Window:buildSettings()
         zindex = 703,
     })
 
-    local closeHit = Build.hitbox(head, {
-        size = UDim2.fromOffset(30, 30),
-        position = UDim2.new(1, -30, 0, 0),
-        zindex = 706,
-    })
-    local closeHolder = Build.frame(head, {
-        name = "CloseHolder",
-        size = UDim2.fromOffset(18, 18),
-        position = UDim2.new(1, -18, 0, 2),
+    -- Close button with a circular hover plate.
+    local closePlate = Build.frame(head, {
+        name = "ClosePlate",
+        size = UDim2.fromOffset(26, 26),
+        position = UDim2.new(1, -26, 0, 10),
         transparency = 1,
         zindex = 704,
     })
+    closePlate.BackgroundColor3 = Theme.BackgroundTertiary
+    closePlate.BackgroundTransparency = 1
+    Build.corner(closePlate, 13)
+    local closeHolder = Build.frame(closePlate, {
+        name = "CloseHolder",
+        size = UDim2.fromOffset(13, 13),
+        position = UDim2.fromScale(0.5, 0.5),
+        anchor = Vector2.new(0.5, 0.5),
+        transparency = 1,
+        zindex = 705,
+    })
     closeHolder.BackgroundTransparency = 1
-    Glyph.new(closeHolder, "close", 14, Theme.SubText, 0.2, 1.8, false)
+    Glyph.new(closeHolder, "close", 12, Theme.SubText, 0.15, 1.8, false)
+
+    local closeHit = Build.hitbox(head, {
+        size = UDim2.fromOffset(30, 30),
+        position = UDim2.new(1, -28, 0, 8),
+        zindex = 706,
+    })
     closeHit.MouseButton1Click:Connect(function()
         self:closeSettings()
     end)
     closeHit.MouseEnter:Connect(function()
-        Glyph.setColor(closeHolder.Glyph_close or closeHolder:FindFirstChild("Glyph_close"), Theme.Error)
+        Anim.tween(closePlate, 0.16, { BackgroundTransparency = 0.35 }, Anim.Ease.gentle)
+        Glyph.setColor(closeHolder:FindFirstChild("Glyph_close"), Theme.Error)
     end)
     closeHit.MouseLeave:Connect(function()
-        Glyph.setColor(closeHolder.Glyph_close or closeHolder:FindFirstChild("Glyph_close"), Theme.SubText)
+        Anim.tween(closePlate, 0.2, { BackgroundTransparency = 1 }, Anim.Ease.gentle)
+        Glyph.setColor(closeHolder:FindFirstChild("Glyph_close"), Theme.SubText)
     end)
+
+    -- Hairline under the head that fades out at both ends.
+    local headLine = Build.frame(head, {
+        name = "HeadLine",
+        size = UDim2.new(1, 0, 0, 1),
+        position = UDim2.new(0, 0, 1, -2),
+        transparency = 1,
+        zindex = 703,
+    })
+    headLine.BackgroundColor3 = Theme.Border
+    headLine.BackgroundTransparency = 0.35
+    local headLineGradient = Build.gradient(headLine, seq(Color3.new(1, 1, 1), Color3.new(1, 1, 1)), 90)
+    headLineGradient.Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 1),
+        NumberSequenceKeypoint.new(0.5, 0),
+        NumberSequenceKeypoint.new(1, 1),
+    })
 
     ----------------------------------------------------------------------
     -- Appearance
     ----------------------------------------------------------------------
-    local appearance = settingsSection:CreateGroup({ name = "Appearance" })
+    local appearance = settingsSection:CreateGroup({ name = "Appearance", icon = "palette" })
 
     -- Declared before the call: the callback closes over `picker`, and writing
     -- `local picker = createColourPicker(... picker ...)` would capture the
@@ -8753,6 +8885,10 @@ function Window:buildSettings()
     end)
     picker.Set(picker, Theme.Accent)
     self.colourPicker = picker
+
+    -- Swatches and theme chips register here so a ring can mark whichever one
+    -- matches the live accent.
+    local presetSelection = {}
 
     -- presets
     local presetRow = Build.frame(appearance.contentHolder, {
@@ -8789,6 +8925,7 @@ function Window:buildSettings()
         dotInner.BackgroundTransparency = 1
         Build.corner(dotInner, 10)
         local innerStroke = Build.stroke(dotInner, Theme.Text, 2, 1)
+        table.insert(presetSelection, { color = preset[2], stroke = innerStroke })
 
         dot.MouseEnter:Connect(function()
             Anim.tween(dotInner, 0.16, { Size = UDim2.fromScale(1.3, 1.3) }, Anim.Ease.spring)
@@ -8811,28 +8948,40 @@ function Window:buildSettings()
     -- picker derives everything from one hue, which works but means a colour
     -- that reads well at full glow can come out muddy at low brightness.
     ----------------------------------------------------------------------
-    appearance:CreateLabel({ text = "Themes", textSize = 11 })
+    settingsSection:CreateLabel({ text = "Themes", textSize = 11 })
 
-    local themeRow = Build.frame(appearance.contentHolder, {
-        name = "ThemePresets",
-        size = UDim2.new(1, 0, 0, 24),
-        transparency = 1,
-        zindex = 20,
-    })
-    themeRow.BackgroundTransparency = 1
-    local themeList = Instance.new("UIListLayout")
-    themeList.FillDirection = Enum.FillDirection.Horizontal
-    themeList.Padding = UDim.new(0, 4)
-    themeList.SortOrder = Enum.SortOrder.LayoutOrder
-    themeList.Parent = themeRow
+    -- Chips wrap onto as many rows as they need. A single fixed row ran the
+    -- last preset (Rosewood) past the panel edge and clipped it in half.
+    local THEME_ROW_MAX = 284
+    local themeRow, themeRowX = nil, 0
+    local function newThemeRow()
+        themeRow = Build.frame(appearance.contentHolder, {
+            name = "ThemePresets",
+            size = UDim2.new(1, 0, 0, 24),
+            transparency = 1,
+            zindex = 20,
+        })
+        themeRow.BackgroundTransparency = 1
+        local themeList = Instance.new("UIListLayout")
+        themeList.FillDirection = Enum.FillDirection.Horizontal
+        themeList.Padding = UDim.new(0, 4)
+        themeList.SortOrder = Enum.SortOrder.LayoutOrder
+        themeList.Parent = themeRow
+        themeRowX = 0
+    end
 
     for index, preset in ipairs(THEME_PRESETS) do
         local measured = TextService:GetTextSize(
             preset[1], 11, Enum.Font.GothamMedium, Vector2.new(220, 30)
         )
+        local chipWidth = math.ceil(measured.X) + 18
+        if not themeRow or themeRowX + chipWidth > THEME_ROW_MAX then
+            newThemeRow()
+        end
+        themeRowX = themeRowX + chipWidth + 4
         local chip = Build.button(themeRow, {
             name = "Theme_" .. preset[1],
-            size = UDim2.fromOffset(math.ceil(measured.X) + 18, 24),
+            size = UDim2.fromOffset(chipWidth, 24),
             transparency = 1,
             zindex = 21,
         })
@@ -8840,6 +8989,7 @@ function Window:buildSettings()
         chip.BackgroundTransparency = 0.78
         Build.corner(chip, 7)
         local chipStroke = Build.stroke(chip, preset[2], 1, 0.35)
+        table.insert(presetSelection, { color = preset[2], stroke = chipStroke, chip = chip })
         Build.text(chip, {
             name = "Label",
             text = preset[1],
@@ -8874,9 +9024,27 @@ function Window:buildSettings()
         end)
     end
 
-    appearance:CreateDivider()
+    -- Ring the swatch / chip that matches the live accent, and keep the head
+    -- chip's gradient in step with the theme. Runs on every accent change.
+    local function refreshPresetSelection()
+        for _, entry in ipairs(presetSelection) do
+            local active = Theme.Accent == entry.color
+            if entry.stroke then
+                entry.stroke.Transparency = active and 0 or (entry.chip and 0.35 or 1)
+            end
+            if entry.chip then
+                entry.chip.BackgroundTransparency = active and 0.5 or 0.78
+            end
+        end
+        headChipGradient.Color = Theme.Gradient
+        headChipStroke.Color = Theme.AccentSoft
+    end
+    LIBRARY:onAccent(refreshPresetSelection)
+    refreshPresetSelection()
 
-    appearance:CreateToggle({
+    settingsSection:CreateDivider()
+
+    settingsSection:CreateToggle({
         name = "Gradient mode",
         description = "Animated gradients vs. a single flat colour",
         flag = "__nc_gradient",
@@ -8886,7 +9054,7 @@ function Window:buildSettings()
         end,
     })
 
-    appearance:CreateSlider({
+    settingsSection:CreateSlider({
         name = "UI transparency",
         description = "How much of the game shows through",
         flag = "__nc_transparency",
@@ -8896,7 +9064,7 @@ function Window:buildSettings()
         callback = function(value) LIBRARY:setTransparency(value) end,
     })
 
-    appearance:CreateSlider({
+    settingsSection:CreateSlider({
         name = "UI scale",
         flag = "__nc_scale",
         min = 0.65, max = 1.35, step = 0.01,
@@ -8904,7 +9072,7 @@ function Window:buildSettings()
         callback = function(value) LIBRARY:setScale(value) end,
     })
 
-    appearance:CreateSlider({
+    settingsSection:CreateSlider({
         name = "Corner roundness",
         flag = "__nc_corner",
         min = 0, max = 24, step = 1,
@@ -8912,7 +9080,7 @@ function Window:buildSettings()
         callback = function(value) LIBRARY:setCorner(value) end,
     })
 
-    appearance:CreateSlider({
+    settingsSection:CreateSlider({
         name = "Glow intensity",
         flag = "__nc_glow",
         min = 0, max = 1, step = 0.05,
@@ -8921,7 +9089,7 @@ function Window:buildSettings()
         callback = function(value) LIBRARY:setGlow(value) end,
     })
 
-    appearance:CreateSlider({
+    settingsSection:CreateSlider({
         name = "Animation speed",
         flag = "__nc_animspeed",
         min = 0.5, max = 2, step = 0.05,
@@ -8930,18 +9098,39 @@ function Window:buildSettings()
         callback = function(value) LIBRARY:setAnimationSpeed(value) end,
     })
 
+    settingsSection:CreateDivider()
+
+    settingsSection:CreateToggle({
+        name = "Mac-style traffic lights",
+        description = "Red, yellow and green window dots at the top-left",
+        flag = "__nc_trafficlights",
+        value = State.TrafficLights ~= false,
+        callback = function(state)
+            LIBRARY:setTrafficLights(state)
+            -- The only place the colours are explained: when the user
+            -- switches the feature, not on every hover.
+            LIBRARY:Notify({
+                Title = state and "Traffic lights on" or "Traffic lights off",
+                Content = state and "Red closes · Yellow minimises · Green zooms."
+                    or "The classic corner buttons are back.",
+                Type = "info",
+                Duration = state and 4.5 or 2.4,
+            })
+        end,
+    })
+
     ----------------------------------------------------------------------
     -- Window icon
     ----------------------------------------------------------------------
-    local winIcon = settingsSection:CreateGroup({ name = "Window icon" })
+    local winIcon = settingsSection:CreateGroup({ name = "Window icon", icon = "image" })
 
-    winIcon:CreateParagraph({
+    settingsSection:CreateParagraph({
         name = "",
         text = "Paste a Roblox asset id (1234567), rbxassetid://, or a full URL. Leave empty to use the built-in NC mark.",
         textSize = 11,
     })
 
-    local iconInput = winIcon:CreateInput({
+    local iconInput = settingsSection:CreateInput({
         name = "Icon asset",
         placeholder = "rbxassetid://1234567",
         clearable = true,
@@ -9061,9 +9250,9 @@ function Window:buildSettings()
     ----------------------------------------------------------------------
     -- Configs
     ----------------------------------------------------------------------
-    local configs = settingsSection:CreateGroup({ name = "Configs" })
+    local configs = settingsSection:CreateGroup({ name = "Configs", icon = "save" })
 
-    local configName = configs:CreateInput({
+    local configName = settingsSection:CreateInput({
         name = "Config name",
         placeholder = "MyConfig",
         clearable = true,
@@ -9121,7 +9310,7 @@ function Window:buildSettings()
     local deleteBtn = makeMiniButton("DeleteConfig", "Delete", 66)
 
     -- Existing configs, as a dropdown the user can pick from.
-    local configDropdown = configs:CreateDropdown({
+    local configDropdown = settingsSection:CreateDropdown({
         name = "Saved configs",
         options = {},
         placeholder = "None yet",
@@ -9248,7 +9437,7 @@ function Window:buildSettings()
         LIBRARY:copyConfigToClipboard(configName.value ~= "" and configName.value or nil)
     end)
 
-    local importInput = configs:CreateInput({
+    local importInput = settingsSection:CreateInput({
         name = "Import string",
         placeholder = "NC1:{...}",
         clearable = true,
@@ -9288,7 +9477,9 @@ function Window:buildSettings()
         end
     end)
 
-    configs:CreateToggle({
+    settingsSection:CreateDivider()
+
+    settingsSection:CreateToggle({
         name = "Per-game configs",
         description = "Keep configs separate for each game. Off shares one folder.",
         flag = "__nc_pergame",
@@ -9306,7 +9497,9 @@ function Window:buildSettings()
         end,
     })
 
-    configs:CreateToggle({
+    settingsSection:CreateDivider()
+
+    settingsSection:CreateToggle({
         name = "Auto save config",
         description = "Save changes as you make them",
         flag = "__nc_autosave",
@@ -9322,7 +9515,7 @@ function Window:buildSettings()
         end,
     })
 
-    configs:CreateToggle({
+    settingsSection:CreateToggle({
         name = "Auto load config",
         description = "Restore your config when the UI loads",
         flag = "__nc_autoload",
@@ -9341,7 +9534,7 @@ function Window:buildSettings()
     ----------------------------------------------------------------------
     -- Behaviour
     ----------------------------------------------------------------------
-    local behaviour = settingsSection:CreateGroup({ name = "Behaviour" })
+    local behaviour = settingsSection:CreateGroup({ name = "Behaviour", icon = "bolt" })
 
     -- Rebindable show/hide key. Click, then press any key; Escape cancels.
     -- (The old label here hard-coded "Toggle key: Right Shift", which was both
@@ -9351,7 +9544,7 @@ function Window:buildSettings()
         return LIBRARY:keyLabel(State.ToggleKey)
     end
 
-    keyButton = behaviour:CreateButton({
+    keyButton = settingsSection:CreateButton({
         name = "Show / hide key",
         description = "Click, then press a key. Escape cancels.",
         icon = "hash",
@@ -9365,23 +9558,7 @@ function Window:buildSettings()
         end,
     })
 
-    behaviour:CreateToggle({
-        name = "Traffic lights",
-        description = "macOS-style dots in the header: red closes, yellow minimises, green zooms.",
-        flag = "__nc_traffic",
-        value = Theme.TrafficLights ~= false,
-        callback = function(state)
-            LIBRARY:setTrafficLights(state)
-            LIBRARY:Notify({
-                Title = "Traffic lights",
-                Content = state and "Header dots shown" or "Header dots hidden",
-                Type = "info",
-                Duration = 2.6,
-            })
-        end,
-    })
-
-    behaviour:CreateToggle({
+    settingsSection:CreateToggle({
         name = "Limit notifications",
         description = "Cap the stack and collapse the rest behind \"+N more\"",
         flag = "__nc_notifycap",
@@ -9401,7 +9578,7 @@ function Window:buildSettings()
         end,
     })
 
-    behaviour:CreateToggle({
+    settingsSection:CreateToggle({
         name = "Move the Show NC pill",
         description = "Let the pill be dragged. Off keeps it fixed where it appears.",
         flag = "__nc_pilldrag",
@@ -9417,7 +9594,7 @@ function Window:buildSettings()
         end,
     })
 
-    behaviour:CreateButton({
+    settingsSection:CreateButton({
         name = "Unload interface",
         description = "Destroys the UI and releases all connections",
         icon = "trash",
@@ -9527,7 +9704,7 @@ end
 -- ═══════════════════════════════════════════════════════════════════════════
 
 LIBRARY.Name = "NC"
-LIBRARY.Version = "1.0.0"
+LIBRARY.Version = "1.1.0"
 
 -- Guard so a double-execute cannot leave two interfaces fighting for input.
 local function existingInterface()
@@ -9569,24 +9746,6 @@ function LIBRARY:setPillDraggable(enabled, silent)
     if State.ShowPill and State.ShowPill.setDraggable then
         State.ShowPill:setDraggable(Theme.PillDraggable)
     end
-    if not silent then LIBRARY:queueAutoSave() end
-end
-
---[[
-    Shows or hides the macOS-style traffic lights in the header.
-
-    Safe to call before the window exists -- applySnapshot reaches this during
-    NC:Init, ahead of the build, so the value is recorded on Theme and the
-    header reads it back when it is created.
-]]
-function LIBRARY:setTrafficLights(enabled, silent)
-    Theme.TrafficLights = enabled and true or false
-
-    local window = State.Window
-    if window and window.setTrafficLights then
-        window:setTrafficLights(Theme.TrafficLights, true)
-    end
-
     if not silent then LIBRARY:queueAutoSave() end
 end
 
@@ -9698,10 +9857,9 @@ function LIBRARY:Init(config)
     if config.pillDraggable ~= nil then
         Theme.PillDraggable = config.pillDraggable and true or false
     end
-
-    -- Opt out of the macOS-style header dots. On unless turned off.
+    -- Mac-style window dots. On unless a script explicitly hides them.
     if config.trafficLights ~= nil then
-        Theme.TrafficLights = config.trafficLights and true or false
+        State.TrafficLights = config.trafficLights and true or false
     end
 
     -- Pull the saved appearance in BEFORE the loading screen is built.
