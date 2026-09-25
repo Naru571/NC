@@ -497,7 +497,17 @@ local function hex(str)
     )
 end
 
-local function seq(a, b) return ColorSequence.new(a, b) end
+-- 2 colours -> even ramp; 3+ colours -> evenly spaced keypoints. The old
+-- two-arg version silently dropped the third colour of ring gradients.
+local function seq(...)
+    local n = select("#", ...)
+    if n <= 2 then return ColorSequence.new(...) end
+    local keys = {}
+    for i = 1, n do
+        table.insert(keys, ColorSequenceKeypoint.new((i - 1) / (n - 1), select(i, ...)))
+    end
+    return ColorSequence.new(keys)
+end
 local function numSeq(a, b) return NumberSequence.new(a, b) end
 
 local function interpolate(a, b, alpha)
@@ -742,6 +752,32 @@ function Build.frame(parent, props)
     return frame
 end
 
+-- Some callers (and scripts written against friendlier libraries) pass text
+-- alignment as a plain string like "center". Roblox rejects strings on enum
+-- properties with "Invalid value "center" for enum TextXAlignment" and kills
+-- the whole loading stage, so normalise them here once.
+local X_ALIGN_NAMES = {
+    left = Enum.TextXAlignment.Left,
+    center = Enum.TextXAlignment.Center,
+    centre = Enum.TextXAlignment.Center,
+    right = Enum.TextXAlignment.Right,
+}
+local Y_ALIGN_NAMES = {
+    top = Enum.TextYAlignment.Top,
+    center = Enum.TextYAlignment.Center,
+    centre = Enum.TextYAlignment.Center,
+    middle = Enum.TextYAlignment.Center,
+    bottom = Enum.TextYAlignment.Bottom,
+}
+
+local function normaliseAlign(map, value, fallback)
+    if value == nil then return fallback end
+    if type(value) == "string" then
+        return map[value:lower()] or fallback
+    end
+    return value
+end
+
 function Build.text(parent, props)
     local label = Instance.new("TextLabel")
     label.BackgroundTransparency = 1
@@ -754,8 +790,8 @@ function Build.text(parent, props)
     label.TextSize = props.size_ or props.textSize or 13
     label.TextColor3 = props.color or Theme.Text
     label.TextTransparency = props.transparency or 0
-    label.TextXAlignment = props.xalign or props.align or Enum.TextXAlignment.Left
-    label.TextYAlignment = props.yalign or props.valign or Enum.TextYAlignment.Center
+    label.TextXAlignment = normaliseAlign(X_ALIGN_NAMES, props.xalign or props.align, Enum.TextXAlignment.Left)
+    label.TextYAlignment = normaliseAlign(Y_ALIGN_NAMES, props.yalign or props.valign, Enum.TextYAlignment.Center)
     label.TextWrapped = (props.wrapped == true) or (props.wrap == true)
     label.RichText = props.rich == true
     label.ZIndex = props.zindex or 2
@@ -1885,6 +1921,24 @@ local NOTIFY_TYPES = {
     error   = { glyph = "error",   color = function() return Theme.Error end },
 }
 
+-- Declared up here, ahead of LIBRARY:Notify, on purpose. Luau resolves locals
+-- lexically: a `local` only exists for code written BELOW its declaration.
+-- When these lived further down the file, Notify read them as unknown
+-- globals (nil) and crashed on `BackgroundColor3 = SHEEN_LIGHT` at runtime --
+-- a crash class the syntax check and the lenient paths never caught.
+local SHEEN_LIGHT = Color3.fromRGB(233, 213, 255)
+
+local function sheenLightGradient(frame)
+    local gradient = Build.gradient(frame, seq(SHEEN_LIGHT, SHEEN_LIGHT), 0)
+    gradient.Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 1),
+        NumberSequenceKeypoint.new(0.22, 0.70),
+        NumberSequenceKeypoint.new(0.78, 0.90),
+        NumberSequenceKeypoint.new(1, 1),
+    })
+    return gradient
+end
+
 local notifyStack = nil
 
 local function ensureNotifyStack()
@@ -1893,15 +1947,17 @@ local function ensureNotifyStack()
     local host = State.Gui or gethui()
     notifyStack = Build.frame(host, {
         name = "NC_Notifications",
-        -- Fill the available width on phones; the constraint below keeps the
-        -- desktop stack compact instead of stretching it across the screen.
+        -- Bottom-right stack (notification design B): newest land closest to
+        -- the corner and older cards flow upward. Fill the available width on
+        -- phones; the constraint below keeps the desktop stack compact
+        -- instead of stretching it across the screen.
         size = UDim2.new(1, -24, 1, 0),
-        position = UDim2.new(1, -12, 0, 12),
+        position = UDim2.new(1, -12, 1, -12),
         transparency = 1,
         zindex = 200,
     })
     notifyStack.BackgroundTransparency = 1
-    notifyStack.AnchorPoint = Vector2.new(1, 0)
+    notifyStack.AnchorPoint = Vector2.new(1, 1)
     notifyStack.Visible = true
     notifyStack.ClipsDescendants = false
 
@@ -1915,6 +1971,9 @@ local function ensureNotifyStack()
     layout.SortOrder = Enum.SortOrder.LayoutOrder
     layout.Padding = UDim.new(0, 8)
     layout.HorizontalAlignment = Enum.HorizontalAlignment.Right
+    -- The group is pinned to the bottom edge of the zero-height anchor frame,
+    -- so the stack grows upward and the newest card hugs the corner.
+    layout.VerticalAlignment = Enum.VerticalAlignment.Bottom
     layout.Parent = notifyStack
 
     return notifyStack
@@ -2032,6 +2091,10 @@ local function refreshNotifyQueue()
         end)
 
         notifyChip.__label = chipLabel
+        -- The stack grows upward from the corner; the "+N more" chip stands
+        -- for the OLDEST parked cards, so it sits above them, not below the
+        -- newest toast.
+        notifyChip.LayoutOrder = -1
     end
 
     notifyChip.Parent = stack
@@ -2054,11 +2117,14 @@ local function unregisterNotification(card)
 end
 
 --[[
-    Notify({ Title, Content, Type, Duration, Icon })
+    Notify({ Title, Content, Type, Duration, Icon, Buttons })
 
     Types: "success" | "info" | "warning" | "error"  (default "info")
     Duration defaults to a length derived from the copy: 3s for a short line,
     up to 9s when there is a body paragraph to read.
+    Buttons (optional): { { Name = "View", Callback = function() end }, ... }
+    draws action pills on the card; the first one is the accent primary.
+    The stack lives bottom-right; hovering a card pauses its timer.
 ]]
 function LIBRARY:Notify(props)
     if State.Destroyed then return end
@@ -2068,62 +2134,115 @@ function LIBRARY:Notify(props)
     props.Icon = props.Icon or props.icon or props.Image or props.image
     local kind = NOTIFY_TYPES[props.Type or props.type or "info"] or NOTIFY_TYPES.info
     local stack = ensureNotifyStack()
-    local host = State.Gui or gethui()
 
     local title = props.Title or props.title or ""
     local content = props.Content or props.content or props.Description or props.description or ""
     local accent = kind.color()
-    local glowAmount = Theme.GlowIntensity
+
+    -- Design B: optional action buttons.
+    --   Buttons = { { Name = "View", Callback = function() end }, ... }
+    -- The first button is drawn as the primary (accent) pill, the rest as
+    -- quiet secondary pills. Any button press dismisses the card.
+    local buttons = props.Buttons or props.buttons or props.Actions or props.actions
+    if type(buttons) ~= "table" or #buttons == 0 then buttons = nil end
 
     local duration = props.Duration or props.duration
     if not duration then
         local length = #title + #content
         duration = math.clamp(2.6 + length / 26, 3, 9)
     end
+    if buttons then duration = math.max(duration, 5) end
 
-    local card = Build.frame(stack, {
+    local H = (content ~= "" and 74 or 58) + (buttons and 30 or 0)
+
+    -- ── outer gradient ring: 1px gradient border, same trick as the cards ──
+    local ring = Build.frame(stack, {
         name = "Notification",
-        size = UDim2.new(1, 0, 0, content ~= "" and 66 or 52),
+        size = UDim2.new(1, 0, 0, H),
         transparency = 1,
         zindex = 201,
     })
+    -- Flat colour when gradient mode is off; the gradient takes over when on.
+    ring.BackgroundColor3 = Theme.Border
+    ring.BackgroundTransparency = 0
+    Build.corner(ring, Theme.Corner + 1)
+    local ringGradient = Build.gradient(ring, seq(Theme.AccentSoft, Theme.AccentSecondary, Theme.Border), 160)
+    ringGradient.Enabled = Theme.GradientMode == true
+    ringGradient.Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 0.25),
+        NumberSequenceKeypoint.new(0.5, 0.62),
+        NumberSequenceKeypoint.new(1, 0.74),
+    })
+    ring.ClipsDescendants = false
+
+    -- ── inner card masks the ring's middle ──────────────────────────────────
+    local card = Build.frame(ring, {
+        name = "NCard",
+        size = UDim2.new(1, -2, 1, -2),
+        position = UDim2.fromOffset(1, 1),
+        transparency = 1,
+        zindex = 2,
+    })
     card.BackgroundColor3 = Theme.BackgroundSecondary
-    card.BackgroundTransparency = 1
-    card.ClipsDescendants = false
+    card.BackgroundTransparency = 0
+    Build.corner(card, Theme.Corner)
+    card.ClipsDescendants = true
 
-    local corner = Build.corner(card, Theme.Corner)
-    local gradient = Build.gradient(card, seq(Theme.BackgroundTertiary, Theme.Background))
+    -- inner top light hairline
+    local topLight = Build.frame(card, {
+        name = "NTopLight",
+        size = UDim2.new(1, -26, 0, 1),
+        position = UDim2.new(0, 13, 0, 0),
+        transparency = 1,
+        zindex = 4,
+    })
+    topLight.BackgroundColor3 = SHEEN_LIGHT
+    topLight.BackgroundTransparency = 0
+    sheenLightGradient(topLight)
+    topLight.Visible = Theme.GradientMode == true
 
-    local stroke = Build.stroke(card, accent, 1, 1)
-    local accentGlow = Build.frame(card, {
-        name = "AccentGlow",
-        size = UDim2.new(0, 3, 1, -16),
-        position = UDim2.new(0, 0, 0.5, 0),
-        anchor = Vector2.new(0, 0.5),
+    -- arrival sheen: one soft sweep across the card
+    local sheen = Build.frame(card, {
+        name = "NSheen",
+        size = UDim2.new(0, 70, 1, 0),
+        position = UDim2.new(0, -80, 0, 0),
+        transparency = 1,
+        zindex = 5,
+    })
+    sheen.BackgroundColor3 = Theme.AccentSoft
+    sheen.BackgroundTransparency = 0
+    local sheenGrad = Build.gradient(sheen, seq(Theme.AccentSoft, Theme.AccentSoft), 90)
+    sheenGrad.Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 1),
+        NumberSequenceKeypoint.new(0.5, 0.82),
+        NumberSequenceKeypoint.new(1, 1),
+    })
+
+    -- ── icon: glowing halo behind a tinted chip ────────────────────────────
+    local halo = Build.frame(card, {
+        name = "NHalo",
+        size = UDim2.fromOffset(46, 46),
+        position = UDim2.new(0, 9, 0, 9),
         transparency = 1,
         zindex = 3,
     })
-    accentGlow.BackgroundColor3 = Theme.Background
-    accentGlow.BackgroundTransparency = 1
-    Build.corner(accentGlow, 2)
-    accentGlow.BackgroundColor3 = accent
-    accentGlow.BackgroundTransparency = 1
+    halo.BackgroundColor3 = accent
+    halo.BackgroundTransparency = 0.82
+    Build.corner(halo, 14)
 
     local iconHost = Build.frame(card, {
-        name = "IconHost",
-        size = UDim2.fromOffset(30, 30),
-        position = UDim2.new(0, 14, 0.5, 0),
-        anchor = Vector2.new(0, 0.5),
+        name = "NIcon",
+        size = UDim2.fromOffset(34, 34),
+        position = UDim2.new(0, 15, 0, 15),
         transparency = 1,
         zindex = 4,
     })
     iconHost.BackgroundColor3 = accent
     iconHost.BackgroundTransparency = 0.86
-    Build.corner(iconHost, 9)
+    Build.corner(iconHost, 10)
 
-    if props.Icon or props.icon then
-        local custom = tostring(props.Icon or props.icon)
-        local resolved = normaliseAsset(custom)
+    if props.Icon then
+        local resolved = normaliseAsset(tostring(props.Icon))
         if resolved then
             local img = Instance.new("ImageLabel")
             img.BackgroundTransparency = 1
@@ -2145,12 +2264,13 @@ function LIBRARY:Notify(props)
         Glyph.new(iconHost, kind.glyph, 17, accent, 0, nil, false)
     end
 
-    local textLeft = 56
-    local titleLabel = Build.text(card, {
+    -- ── copy ────────────────────────────────────────────────────────────────
+    local textLeft = 62
+    Build.text(card, {
         name = "Title",
         text = title,
-        size = UDim2.new(1, -(textLeft + 16), 0, 18),
-        position = UDim2.new(0, textLeft, 0, content ~= "" and 15 or 17),
+        size = UDim2.new(1, -(textLeft + 30), 0, 18),
+        position = UDim2.new(0, textLeft, 0, content ~= "" and 14 or 16),
         font = Enum.Font.GothamBold,
         textSize = 13,
         color = Theme.Text,
@@ -2160,9 +2280,9 @@ function LIBRARY:Notify(props)
 
     if content ~= "" then
         Build.text(card, {
-            name = "Content",
+            name = "Description",
             text = content,
-            size = UDim2.new(1, -(textLeft + 16), 0, 28),
+            size = UDim2.new(1, -(textLeft + 18), 0, 30),
             position = UDim2.new(0, textLeft, 0, 32),
             font = Enum.Font.Gotham,
             textSize = 12,
@@ -2173,70 +2293,155 @@ function LIBRARY:Notify(props)
         })
     end
 
+    -- ── action buttons ──────────────────────────────────────────────────────
+    local dismissRef = { fn = function() end }
+    if buttons then
+        local holder = Build.frame(card, {
+            name = "NButtons",
+            size = UDim2.new(1, -(textLeft + 12), 0, 22),
+            position = UDim2.new(0, textLeft, 1, -28),
+            transparency = 1,
+            zindex = 6,
+        })
+        holder.BackgroundTransparency = 1
+        local list = Instance.new("UIListLayout")
+        list.FillDirection = Enum.FillDirection.Horizontal
+        list.SortOrder = Enum.SortOrder.LayoutOrder
+        list.Padding = UDim.new(0, 7)
+        list.Parent = holder
+
+        for index, spec in ipairs(buttons) do
+            if type(spec) == "table" then
+                local isPrimary = index == 1
+                local btn = Instance.new("TextButton")
+                btn.Name = isPrimary and "NBtnP" or "NBtn"
+                btn.AutoButtonColor = false
+                btn.Size = UDim2.new(0, 0, 1, 0)
+                btn.AutomaticSize = Enum.AutomaticSize.X
+                btn.BackgroundColor3 = isPrimary and Theme.Accent or Theme.BackgroundTertiary
+                btn.BackgroundTransparency = isPrimary and 0.05 or 0.2
+                btn.TextColor3 = isPrimary and Color3.fromRGB(255, 255, 255) or Theme.Text
+                btn.Font = Enum.Font.GothamSemibold
+                btn.TextSize = 11
+                btn.Text = "  " .. tostring(spec.Name or spec.name or spec.Title or spec.title or "OK") .. "  "
+                btn.ZIndex = 7
+                btn.LayoutOrder = index
+                btn.Parent = holder
+                Build.corner(btn, 999)
+                if isPrimary then
+                    local primaryGradient = Build.gradient(btn, seq(Theme.Accent, Theme.AccentSecondary), Theme.GradientAngle)
+                    primaryGradient.Enabled = Theme.GradientMode == true
+                end
+                local cb = spec.Callback or spec.callback
+                btn.MouseButton1Click:Connect(function()
+                    if cb then task.spawn(cb) end
+                    dismissRef.fn()
+                end)
+            end
+        end
+    end
+
+    -- ── dismiss × ───────────────────────────────────────────────────────────
+    local close = Instance.new("TextButton")
+    close.Name = "NClose"
+    close.AutoButtonColor = false
+    close.Size = UDim2.fromOffset(20, 20)
+    close.Position = UDim2.new(1, -26, 0, 8)
+    close.BackgroundColor3 = Theme.BackgroundTertiary
+    close.BackgroundTransparency = 1
+    close.TextColor3 = Theme.SubText
+    close.Font = Enum.Font.GothamBold
+    close.TextSize = 13
+    close.Text = "×"
+    close.ZIndex = 8
+    close.Parent = card
+    Build.corner(close, 6)
+
+    -- ── progress: thin drain bar along the bottom edge ─────────────────────
     local progress = Build.frame(card, {
-        name = "ProgressTrack",
-        size = UDim2.new(1, -32, 0, 3),
-        position = UDim2.new(0, 16, 1, -10),
+        name = "NTrack",
+        size = UDim2.new(1, -24, 0, 2),
+        position = UDim2.new(0, 12, 1, -7),
         transparency = 1,
         zindex = 5,
     })
     progress.BackgroundColor3 = Theme.BackgroundTertiary
-    progress.BackgroundTransparency = 0.28
+    progress.BackgroundTransparency = 0.4
     Build.corner(progress, 2)
 
-    local progressFill = Build.frame(progress, {
-        name = "ProgressFill",
+    local fill = Build.frame(progress, {
+        name = "NFill",
         size = UDim2.fromScale(1, 1),
         transparency = 1,
         zindex = 6,
     })
-    progressFill.BackgroundColor3 = accent
-    progressFill.BackgroundTransparency = 0.02
-    Build.corner(progressFill, 2)
+    fill.BackgroundColor3 = accent
+    fill.BackgroundTransparency = 0.05
+    Build.corner(fill, 2)
 
-    -- Entrance: slide from the right and fade in together.
-    card.Position = UDim2.new(0, 46, 0, 0)
-    Anim.tween(card, 0.34, { Position = UDim2.new(0, 0, 0, 0) },
-        Anim.Ease.spring, Anim.Dir.out)
-    Anim.tween(stroke, 0.34, { Transparency = 0.72 }, Anim.Ease.soft)
-    Anim.tween(accentGlow, 0.4, { BackgroundTransparency = 1 - math.min(0.95, 0.55 * (glowAmount + 0.4)) }, Anim.Ease.soft)
-    -- UIGradient.Transparency is a NumberSequence, never a number. TweenService
-    -- rejects a scalar here at Create() time with "NumberSequence expected, got
-    -- number", so the whole notification used to throw on entry. Fade the card's
-    -- own solid fill instead and leave the gradient to supply its colour.
-    Anim.tween(card, 0.34, { BackgroundTransparency = Theme.Transparency },
-        Anim.Ease.soft)
-    Anim.tween(titleLabel, 0.3, { TextTransparency = 0 })
+    -- hover strip pauses the timer and doubles as click-to-dismiss. It sits
+    -- below the action buttons / close so they keep their clicks.
+    local hit = Build.hitbox(card, { zindex = 6 })
 
-    Anim.tween(progressFill, duration, { Size = UDim2.fromScale(0, 1) }, Anim.Ease.linear, Anim.Dir.out)
-
+    -- ── lifecycle: manual clock so hover can pause the drain ───────────────
     local dismissed = false
+    local remaining = duration
+    local paused = false
+    local clockConn = nil
+
     local dismiss
     dismiss = function()
         if dismissed then return end
         dismissed = true
+        if clockConn then clockConn:Disconnect() clockConn = nil end
         -- Leave the queue first so the stack re-flows immediately rather than
-        -- after the 0.28s exit animation.
-        unregisterNotification(card)
-        Anim.tween(card, 0.26, { Position = UDim2.new(0, 46, 0, 0), BackgroundTransparency = 1 }, Anim.Ease.soft, Anim.Dir.inward)
-        Anim.tween(stroke, 0.26, { Transparency = 1 }, Anim.Ease.soft, Anim.Dir.inward)
-        Anim.tween(iconHost, 0.26, { BackgroundTransparency = 1 }, Anim.Ease.soft, Anim.Dir.inward)
+        -- after the exit animation.
+        unregisterNotification(ring)
+        Anim.tween(ring, 0.24, { BackgroundTransparency = 1 }, Anim.Ease.soft, Anim.Dir.inward)
+        Anim.tween(card, 0.24, { Position = UDim2.fromOffset(1, 10), BackgroundTransparency = 1 }, Anim.Ease.soft, Anim.Dir.inward)
         task.delay(0.28, function()
-            if card then card:Destroy() end
+            if ring then ring:Destroy() end
         end)
     end
+    dismissRef.fn = dismiss
 
-    task.delay(duration, dismiss)
+    clockConn = RunService.RenderStepped:Connect(function(dt)
+        if dismissed then return end
+        if paused then return end
+        remaining = remaining - dt
+        if remaining <= 0 then
+            dismiss()
+            return
+        end
+        fill.Size = UDim2.fromScale(remaining / duration, 1)
+    end)
 
-    local hit = Build.hitbox(card, { zindex = 10 })
+    hit.MouseEnter:Connect(function() paused = true end)
+    hit.MouseLeave:Connect(function() paused = false end)
     hit.MouseButton1Click:Connect(dismiss)
-    -- Keep the stack usable even if a custom icon asset failed to load.
-    if not card.Parent then return { dismiss = function() end, frame = nil } end
+    close.MouseButton1Click:Connect(dismiss)
 
-    table.insert(State.NotifyQueue, { card = card, dismiss = dismiss })
+    -- ── entrance: spring pop-in from below + sheen sweep ───────────────────
+    ring.BackgroundTransparency = 1
+    card.Position = UDim2.fromOffset(1, 16)
+    card.BackgroundTransparency = 1
+    Anim.tween(ring, 0.34, { BackgroundTransparency = 0 }, Anim.Ease.soft)
+    Anim.tween(card, 0.4, { Position = UDim2.fromOffset(1, 1), BackgroundTransparency = 0 }, Anim.Ease.spring)
+    if Theme.GradientMode then
+        Anim.tween(sheen, 0.9, { Position = UDim2.new(1, 80, 0, 0) }, Anim.Ease.soft)
+        task.delay(1.1, function()
+            if sheen.Parent then sheen.Visible = false end
+        end)
+    else
+        sheen.Visible = false
+    end
+
+    if not ring.Parent then return { dismiss = function() end, frame = nil } end
+
+    table.insert(State.NotifyQueue, { card = ring, dismiss = dismiss })
     refreshNotifyQueue()
 
-    return { dismiss = dismiss, frame = card }
+    return { dismiss = dismiss, frame = ring }
 end
 
 function LIBRARY:Toast(props)
@@ -2640,9 +2845,12 @@ function LoadingScreen.new(gui, title, subtitle)
         self.spinner.Rotation = (self.spin * 260) % 360
         self.statusDot.BackgroundTransparency = 0.15 + t * 0.45
 
-        -- sheen sweeps across the filled portion
-        local span = math.max(1, self.target * 348)
-        self.shimmer.Position = UDim2.fromOffset(((self.clock * 150) % (span + 92)) - 46, 0)
+        -- The pale sheen rides just behind the leading edge, clipped to the
+        -- filled portion. (It used to sweep the whole span on its own clock;
+        -- once the fill itself became visible that read as a light segment
+        -- lagging behind the knob. Riding the edge restores the old look.)
+        local w = self.fill.Size.X.Scale * 348
+        self.shimmer.Position = UDim2.fromOffset(w - 46 + math.sin(self.clock * 2.2) * 6, 0)
 
         self.backdropGradient.Offset = Vector2.new(math.sin(self.clock * 0.18) * 0.25, 0)
     end))
@@ -2903,11 +3111,16 @@ local function makeDraggable(handle, target, options)
             local maxY = math.max(minY, parentSize.Y / scale - height * (1 - anchor.Y))
             local newX = math.clamp(startPos.X.Offset + delta.X, minX, maxX)
             local newY = math.clamp(startPos.Y.Offset + delta.Y, minY, maxY)
-            target.Position = UDim2.new(anchor.X, newX, anchor.Y, newY)
+            -- Scale stays 0: bakeToOffsets converted the position to pure
+            -- offsets. Writing anchor.X back as the X scale (as an earlier
+            -- version did) added half the viewport on the first drag frame,
+            -- flinging the pill to the right edge while the pointer dragged
+            -- an "invisible box".
+            target.Position = UDim2.new(0, newX, 0, newY)
         else
             target.Position = UDim2.new(
-                anchor.X, startPos.X.Offset + delta.X,
-                anchor.Y, startPos.Y.Offset + delta.Y
+                0, startPos.X.Offset + delta.X,
+                0, startPos.Y.Offset + delta.Y
             )
         end
     end))
@@ -3363,6 +3576,28 @@ local function paintInstance(self, inst, ctx)
         elseif n == "Field" or n == "Track" or n == "SearchBar" or n == "Profile" then
             inst.BackgroundColor3 = Theme.BackgroundTertiary
             if n ~= "SearchBar" then inst.BackgroundTransparency = alpha(0.20, 0.7) end
+        elseif n == "Switch" then
+            -- Toggle pill. The old code lumped these under the generic "Track"
+            -- rule, which repainted every ON toggle back to the dim tertiary
+            -- colour on every theme refresh. The live state rides an attribute
+            -- so the repaint can honour it.
+            local on = inst:GetAttribute("nc_on") == true
+            inst.BackgroundColor3 = on and Theme.Accent or Theme.BackgroundTertiary
+            inst.BackgroundTransparency = on and 0.05 or alpha(0.35, 0.7)
+        elseif n == "NCard" then
+            inst.BackgroundColor3 = Theme.BackgroundSecondary
+        elseif n == "NTopLight" then
+            inst.Visible = gradientOn
+        elseif n == "NTrack" then
+            inst.BackgroundColor3 = Theme.BackgroundTertiary
+            inst.BackgroundTransparency = 0.4
+        elseif n == "NClose" then
+            inst.BackgroundColor3 = Theme.BackgroundTertiary
+            inst.TextColor3 = Theme.SubText
+        elseif n == "NBtn" then
+            inst.BackgroundColor3 = Theme.BackgroundTertiary
+            inst.BackgroundTransparency = 0.2
+            inst.TextColor3 = Theme.Text
         elseif n == "Plate" then
             local owner = inst.Parent and inst.Parent.Name or ""
             inst.BackgroundColor3 = Theme.BackgroundTertiary
@@ -3392,6 +3627,10 @@ local function paintInstance(self, inst, ctx)
             inst.Color = Theme.Border
         elseif parentName == "Field" or parentName == "Track" then
             inst.Color = Theme.Border
+        elseif parentName == "Switch" then
+            local on = inst.Parent and inst.Parent:GetAttribute("nc_on") == true
+            inst.Color = on and Theme.AccentSoft or Theme.Border
+            inst.Transparency = on and 0.2 or 0.5
         elseif parentName == "Plate" then
             inst.Color = Theme.Border
         elseif parentName == "Indicator" then
@@ -3410,6 +3649,12 @@ local function paintInstance(self, inst, ctx)
             inst.Enabled = false
         elseif parentName == "SettingsPanel" then
             inst.Enabled = gradientOn
+        elseif parentName == "Notification" then
+            inst.Color = seq(Theme.AccentSoft, Theme.AccentSecondary, Theme.Border)
+            inst.Enabled = gradientOn
+        elseif parentName == "NBtnP" then
+            inst.Color = seq(Theme.Accent, Theme.AccentSecondary)
+            inst.Enabled = gradientOn
         end
     elseif inst:IsA("UICorner") then
         local parentName = inst.Parent and inst.Parent.Name or ""
@@ -3418,7 +3663,7 @@ local function paintInstance(self, inst, ctx)
             radius = Theme.CornerLarge
         elseif parentName == "Knob" or parentName == "KnobGlow" or parentName == "HueCursor" then
             radius = 999
-        elseif parentName == "Track" then
+        elseif parentName == "Track" or parentName == "Switch" then
             radius = 999
         end
         inst.CornerRadius = UDim.new(0, radius)
@@ -3441,6 +3686,282 @@ local function windowPaintChunk(self, limit)
         self._paintQueue = nil
         self._paintCtx = nil
     end
+end
+
+-- ═══════════════════════════════════════════════════════════════════════════
+--  SURFACE REFINE  (material pass)
+--
+--  Gradient edge rings + inner top lights on cards, lit icon chips, accent
+--  ticks beside section titles, scroll fades and a cursor spotlight that
+--  follows the mouse across rows. The gradient-flavoured layers follow
+--  Theme.GradientMode; every handler re-applies itself on accent changes and
+--  prunes itself once its instances are gone.
+-- ═══════════════════════════════════════════════════════════════════════════
+
+local decorHandlers = {}
+local decorHooked = false
+local hookDecorRefresh
+
+local function registerDecor(fn)
+    hookDecorRefresh()
+    table.insert(decorHandlers, fn)
+end
+
+hookDecorRefresh = function()
+    if decorHooked then return end
+    decorHooked = true
+    LIBRARY:onAccent(function()
+        for i = #decorHandlers, 1, -1 do
+            local ok, alive = pcall(decorHandlers[i])
+            if not ok or alive == false then
+                table.remove(decorHandlers, i)
+            end
+        end
+    end)
+end
+
+-- Gradient ring + 1px top light for a card shell. The ring is a child frame
+-- 1px larger than the shell on every side, drawn one ZIndex below it, so the
+-- shell's own background masks the middle and only the edge shows -- a
+-- gradient border without any texture asset.
+local function addCardSheen(shell)
+    local ring = Build.frame(shell, {
+        name = "EdgeRing",
+        size = UDim2.new(1, 2, 1, 2),
+        position = UDim2.fromOffset(-1, -1),
+        transparency = 1,
+        corner = false,
+        zindex = 3,
+    })
+    -- The gradient supplies the alpha; a base transparency of 1 would hide
+    -- the UIGradient entirely.
+    ring.BackgroundTransparency = 0
+    Build.corner(ring, Theme.Corner + 1)
+    local ringGradient = Build.gradient(ring, seq(Theme.AccentSoft, Theme.AccentSecondary, Theme.Border), 160)
+    ringGradient.Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 0.30),
+        NumberSequenceKeypoint.new(0.45, 0.74),
+        NumberSequenceKeypoint.new(1, 0.80),
+    })
+
+    local topLight = Build.frame(shell, {
+        name = "TopLight",
+        size = UDim2.new(1, -26, 0, 1),
+        position = UDim2.new(0, 13, 0, 0),
+        transparency = 1,
+        corner = false,
+        zindex = 6,
+    })
+    topLight.BackgroundColor3 = SHEEN_LIGHT
+    topLight.BackgroundTransparency = 0
+    sheenLightGradient(topLight)
+
+    local function apply()
+        if not shell.Parent then return false end
+        local on = Theme.GradientMode
+        ring.Visible = on
+        topLight.Visible = on
+        if on then
+            Build.corner(ring, Theme.Corner + 1)
+            ringGradient.Color = seq(Theme.AccentSoft, Theme.AccentSecondary, Theme.Border)
+        end
+        return true
+    end
+    apply()
+    registerDecor(apply)
+    return ring, topLight
+end
+
+-- The 3px accent tick that marks a section title.
+local function addAccentTick(parent, x)
+    local tick = Build.frame(parent, {
+        name = "AccentTick",
+        size = UDim2.fromOffset(3, 14),
+        position = UDim2.new(0, x, 0, 1),
+        transparency = 1,
+        corner = false,
+        zindex = 6,
+    })
+    tick.BackgroundColor3 = Theme.Accent
+    Build.corner(tick, 2)
+    local tickGradient = Build.gradient(tick, seq(Theme.AccentSoft, Theme.AccentSecondary), 90)
+
+    local function apply()
+        if not tick.Parent then return false end
+        tick.BackgroundColor3 = Theme.Accent
+        tickGradient.Enabled = Theme.GradientMode
+        tickGradient.Color = seq(Theme.AccentSoft, Theme.AccentSecondary)
+        return true
+    end
+    apply()
+    registerDecor(apply)
+    return tick
+end
+
+-- Lit icon chip for element rows: accent-tinted gradient, inner top light,
+-- soft halo. In flat mode it falls back to a quiet bordered square.
+local function buildIconChip(row)
+    local glow = Build.frame(row, {
+        name = "ChipGlow",
+        size = UDim2.fromOffset(36, 36),
+        position = UDim2.new(0, 13, 0.5, 0),
+        anchor = Vector2.new(0.5, 0.5),
+        transparency = 1,
+        corner = false,
+        zindex = 5,
+    })
+    glow.BackgroundColor3 = Theme.Accent
+    glow.BackgroundTransparency = 0.88
+    Build.corner(glow, 13)
+
+    local chip = Build.frame(row, {
+        name = "IconChip",
+        size = UDim2.fromOffset(26, 26),
+        position = UDim2.new(0, 0, 0.5, 0),
+        anchor = Vector2.new(0, 0.5),
+        transparency = 1,
+        corner = false,
+        zindex = 6,
+    })
+    chip.BackgroundColor3 = Theme.BackgroundTertiary
+    Build.corner(chip, 8)
+    local chipStroke = Build.stroke(chip, Theme.AccentSoft, 1, 0.62)
+    local chipGradient = Build.gradient(chip, seq(Theme.Accent, Theme.AccentSecondary), 150)
+    chipGradient.Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 0.70),
+        NumberSequenceKeypoint.new(1, 0.86),
+    })
+
+    local light = Build.frame(chip, {
+        name = "ChipLight",
+        size = UDim2.new(1, -8, 0, 1),
+        position = UDim2.new(0, 4, 0, 1),
+        transparency = 1,
+        corner = false,
+        zindex = 7,
+    })
+    light.BackgroundColor3 = SHEEN_LIGHT
+    light.BackgroundTransparency = 0
+    local lightGradient = Build.gradient(light, seq(SHEEN_LIGHT, SHEEN_LIGHT), 0)
+    lightGradient.Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 1),
+        NumberSequenceKeypoint.new(0.5, 0.86),
+        NumberSequenceKeypoint.new(1, 1),
+    })
+
+    local function apply()
+        if not chip.Parent then return false end
+        if Theme.GradientMode then
+            chip.BackgroundTransparency = 0
+            chipGradient.Enabled = true
+            chipGradient.Color = seq(Theme.Accent, Theme.AccentSecondary)
+            chipStroke.Color = Theme.AccentSoft
+            chipStroke.Transparency = 0.62
+            light.Visible = true
+            glow.Visible = true
+            glow.BackgroundColor3 = Theme.Accent
+        else
+            chip.BackgroundColor3 = Theme.BackgroundTertiary
+            chip.BackgroundTransparency = 0.25
+            chipGradient.Enabled = false
+            chipStroke.Color = Theme.Border
+            chipStroke.Transparency = 0.45
+            light.Visible = false
+            glow.Visible = false
+        end
+        return true
+    end
+    apply()
+    registerDecor(apply)
+    return chip
+end
+
+-- Cursor spotlight: one global mouse listener hit-tests registered rows and
+-- moves a nested-disc radial glow (see buildRadialGlow) under the pointer.
+local Spotlight = { rows = {}, peaks = {}, active = nil, conn = nil }
+
+local function spotlightShown(row)
+    local inst = row
+    while inst do
+        if inst:IsA("GuiObject") and not inst.Visible then return false end
+        inst = inst.Parent
+    end
+    return true
+end
+
+local function spotlightEnsure(row)
+    local holder = row:FindFirstChild("Spotlight")
+    if holder then return holder, Spotlight.peaks[holder] end
+    row.ClipsDescendants = true
+    local setPeak
+    holder, setPeak = buildRadialGlow(row, 220, Theme.AccentSoft, {
+        name = "Spotlight",
+        peak = 0,
+        layers = 10,
+        zindex = 6,
+    })
+    holder.Size = UDim2.fromOffset(220, 90)
+    holder.Visible = false
+    Spotlight.peaks[holder] = setPeak
+    return holder, setPeak
+end
+
+function Spotlight.register(row)
+    table.insert(Spotlight.rows, row)
+end
+
+function Spotlight.listen()
+    -- Re-runs after a full destroy/re-init: the old connection is dead, so
+    -- check .Connected rather than just presence.
+    if Spotlight.conn and Spotlight.conn.Connected then return end
+    Spotlight.conn = addConnection(UserInputService.InputChanged:Connect(function(input)
+        if State.Destroyed then return end
+        if input.UserInputType ~= Enum.UserInputType.MouseMovement then return end
+        local mx, my = input.Position.X, input.Position.Y
+
+        local hit
+        for i = #Spotlight.rows, 1, -1 do
+            local row = Spotlight.rows[i]
+            if not row.Parent then
+                table.remove(Spotlight.rows, i)
+            elseif not hit then
+                local p = row.AbsolutePosition
+                local s = row.AbsoluteSize
+                if mx >= p.X and mx <= p.X + s.X and my >= p.Y and my <= p.Y + s.Y
+                    and spotlightShown(row) then
+                    hit = row
+                end
+            end
+        end
+
+        if hit ~= Spotlight.active then
+            local old = Spotlight.active
+            Spotlight.active = nil
+            if old and old.Parent then
+                local holder = old:FindFirstChild("Spotlight")
+                if holder then
+                    holder.Visible = false
+                    local setPeak = Spotlight.peaks[holder]
+                    if setPeak then setPeak(0) end
+                end
+            end
+            if hit then
+                local holder, setPeak = spotlightEnsure(hit)
+                Spotlight.peaks[holder] = setPeak
+                holder.Visible = true
+                if setPeak then setPeak(0.13) end
+                Spotlight.active = hit
+            end
+        end
+
+        if hit then
+            local holder = hit:FindFirstChild("Spotlight")
+            if holder then
+                local p = hit.AbsolutePosition
+                holder.Position = UDim2.fromOffset(mx - p.X, my - p.Y)
+            end
+        end
+    end))
 end
 
 function Window.new(gui, config)
@@ -3738,6 +4259,66 @@ function Window.new(gui, config)
         gap = 2,
         zindex = 8,
     })
+
+    -- Sliding selection pill: ONE shared indicator that glides between tabs
+    -- instead of each pill lighting itself. Parented to Rail (not RailScroll)
+    -- because RailScroll's UIListLayout would otherwise treat it as another
+    -- row and shove the pills around. Its position is rebased against the
+    -- rail, the same way the slim Indicator has always done it.
+    -- (34 == TAB_PILL_HEIGHT; that local is declared further down, out of
+    -- scope for Window.new, so the number is written out here.)
+    self.railPill = Build.frame(self.rail, {
+        name = "RailSel",
+        size = UDim2.new(1, -10, 0, 34),
+        position = UDim2.fromOffset(10, 0),
+        transparency = 1,
+        corner = false,
+        zindex = 7,
+    })
+    self.railPill.BackgroundTransparency = 0
+    self.railPill.BackgroundColor3 = Theme.Accent
+    Build.corner(self.railPill, 9)
+    self.railPillStroke = Build.stroke(self.railPill, Theme.Accent, 1, 0.35)
+    self.railPillGradient = Build.gradient(self.railPill, seq(Theme.Accent, Theme.AccentSecondary), 0)
+    self.railPillGradient.Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 0.74),
+        NumberSequenceKeypoint.new(1, 0.86),
+    })
+
+    local railSelLight = Build.frame(self.railPill, {
+        name = "RailSelLight",
+        size = UDim2.new(1, -10, 0, 1),
+        position = UDim2.new(0, 5, 0, 1),
+        transparency = 1,
+        corner = false,
+        zindex = 8,
+    })
+    railSelLight.BackgroundColor3 = SHEEN_LIGHT
+    railSelLight.BackgroundTransparency = 0
+    sheenLightGradient(railSelLight)
+
+    registerDecor(function()
+        if not self.railPill or not self.railPill.Parent then return false end
+        if Theme.GradientMode then
+            self.railPill.BackgroundTransparency = 0
+            self.railPillGradient.Enabled = true
+            self.railPillGradient.Color = seq(Theme.Accent, Theme.AccentSecondary)
+        else
+            self.railPill.BackgroundColor3 = Theme.Accent
+            self.railPill.BackgroundTransparency = 0.82
+            self.railPillGradient.Enabled = false
+        end
+        self.railPillStroke.Color = Theme.Accent
+        return true
+    end)
+
+    -- Leaving the rail sends the indicator home to the active tab.
+    table.insert(State.Connections, self.rail.MouseLeave:Connect(function()
+        if self.activeTab then self:moveRailPill(self.activeTab, false, 0.26) end
+    end))
+
+    -- Cursor spotlight: one global mouse listener for every row.
+    Spotlight.listen()
 
     ----------------------------------------------------------------------
     -- content area
@@ -5487,8 +6068,11 @@ function Tab.new(window, props)
     ----------------------------------------------------------------
     -- rail pill
     ----------------------------------------------------------------
+    -- Named NavPill_ (not Tab_) so the chunked painter's "Tab_" gradient rule
+    -- cannot re-enable the pill's own gradient: the shared RailSel indicator
+    -- owns the active highlight now.
     self.pill = Build.frame(window.railScroll, {
-        name = "Tab_" .. self.name,
+        name = "NavPill_" .. self.name,
         size = UDim2.new(1, 0, 0, TAB_PILL_HEIGHT),
         transparency = 1,
         zindex = 8,
@@ -5511,6 +6095,9 @@ function Tab.new(window, props)
         shiftColor(Theme.Accent, -0.70),
         shiftColor(Theme.Accent, -0.86)
     ), 0)
+    -- Highlighting moved to the shared RailSel indicator; the pill's own
+    -- gradient never re-enables (Tab:recolour / Tab:select keep it off).
+    self.pillGradient.Enabled = false
 
     self.pillStroke = Build.stroke(self.pill, Theme.Border, 1, 1)
 
@@ -5583,17 +6170,63 @@ function Tab.new(window, props)
     self.page.AutomaticCanvasSize = Enum.AutomaticSize.Y
     self.page.CanvasSize = UDim2.new()
 
+    -- Scroll fades: content dissolves at the top and bottom edges instead of
+    -- hard-clipping mid-row. Passive frames never capture input, so they can
+    -- safely float above the scrolling content.
+    self.fadeTop = Build.frame(window.content, {
+        name = "FadeTop",
+        size = UDim2.new(1, 0, 0, 26),
+        position = UDim2.fromOffset(0, 0),
+        transparency = 1,
+        corner = false,
+        zindex = 30,
+        visible = false,
+    })
+    self.fadeTop.BackgroundColor3 = Theme.Background
+    self.fadeTop.BackgroundTransparency = 0
+    Build.gradient(self.fadeTop, seq(Theme.Background, Theme.Background), 90).Transparency =
+        NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 0),
+            NumberSequenceKeypoint.new(1, 1),
+        })
+
+    self.fadeBottom = Build.frame(window.content, {
+        name = "FadeBottom",
+        size = UDim2.new(1, 0, 0, 26),
+        position = UDim2.new(0, 0, 1, -26),
+        transparency = 1,
+        corner = false,
+        zindex = 30,
+        visible = false,
+    })
+    self.fadeBottom.BackgroundColor3 = Theme.Background
+    self.fadeBottom.BackgroundTransparency = 0
+    Build.gradient(self.fadeBottom, seq(Theme.Background, Theme.Background), 270).Transparency =
+        NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 0),
+            NumberSequenceKeypoint.new(1, 1),
+        })
+
+    registerDecor(function()
+        if not self.page or not self.page.Parent then return false end
+        for _, fade in ipairs({ self.fadeTop, self.fadeBottom }) do
+            fade.BackgroundColor3 = Theme.Background
+            local gradient = fade:FindFirstChildOfClass("UIGradient")
+            if gradient then gradient.Color = seq(Theme.Background, Theme.Background) end
+        end
+        return true
+    end)
+
+    -- Hover previews the shared indicator on this pill; leaving the rail
+    -- entirely sends it back to the active tab (wired in Window.new).
     table.insert(self.connections, self.pillHit.MouseEnter:Connect(function()
         if window.activeTab == self then return end
-        Anim.tween(self.pill, 0.18, {
-            BackgroundTransparency = math.max(0, 0.70 - Theme.Transparency),
-        }, Anim.Ease.gentle)
+        window:moveRailPill(self, false, 0.22)
         if self.pillLabel then Anim.tween(self.pillLabel, 0.18, { TextColor3 = Theme.Text }, Anim.Ease.gentle) end
     end))
 
     table.insert(self.connections, self.pillHit.MouseLeave:Connect(function()
         if window.activeTab == self then return end
-        Anim.tween(self.pill, 0.22, { BackgroundTransparency = 1 }, Anim.Ease.gentle)
         if self.pillLabel then Anim.tween(self.pillLabel, 0.22, { TextColor3 = Theme.SubText }, Anim.Ease.gentle) end
     end))
 
@@ -5652,6 +6285,27 @@ function Tab:CreateSection(props)
     return section
 end
 
+-- Glides the shared selection pill to a tab's rail position. RailPill lives
+-- on Rail, so the target is rebased from the pill's absolute position.
+function Window:moveRailPill(tab, instant, duration)
+    if not self.railPill or not self.railPill.Parent then return end
+    if not tab or not tab.pill or not tab.pill.Parent then return end
+    -- AbsolutePosition is screen-space (post UIScale); railPill.Position is
+    -- parent-space. Divide the delta through the live scale so the indicator
+    -- lands on the pill at any UI scale.
+    local railScale = (UI_SCALE_CONTAINER and UI_SCALE_CONTAINER.Scale) or 1
+    local targetY = (tab.pill.AbsolutePosition.Y - self.rail.AbsolutePosition.Y) / railScale
+    Anim.tween(self.railPill, instant and 0.01 or (duration or 0.3), {
+        Position = UDim2.fromOffset(10, targetY),
+        Size = UDim2.new(1, -10, 0, TAB_PILL_HEIGHT),
+    }, Anim.Ease.spring)
+end
+
+function Tab:setFadesVisible(visible)
+    if self.fadeTop then self.fadeTop.Visible = visible end
+    if self.fadeBottom then self.fadeBottom.Visible = visible end
+end
+
 function Tab:select(noAnimation)
     local window = self.window
     if window.activeTab == self then return end
@@ -5662,7 +6316,10 @@ function Tab:select(noAnimation)
     -- move the indicator to this pill
     -- The indicator is parented to Rail, not RailScroll.  Rebasing against
     -- RailScroll was the source of the purple active background being offset.
-    local targetY = self.pill.AbsolutePosition.Y - window.rail.AbsolutePosition.Y
+    -- AbsolutePosition is screen-space (post UIScale) while Position is
+    -- parent-space, so divide the delta out through the live scale.
+    local railScale = (UI_SCALE_CONTAINER and UI_SCALE_CONTAINER.Scale) or 1
+    local targetY = (self.pill.AbsolutePosition.Y - window.rail.AbsolutePosition.Y) / railScale
 
     local indicatorY = targetY + math.floor((TAB_PILL_HEIGHT - 24) / 2)
     local glowY = targetY
@@ -5679,17 +6336,15 @@ function Tab:select(noAnimation)
         BackgroundTransparency = 1 - 0.20 * (0.3 + Theme.GlowIntensity * 0.7),
     }, Anim.Ease.spring)
 
+    -- The shared selection pill glides over; the pill itself stays clear.
+    window:moveRailPill(self, noAnimation)
+
     -- swap pill states
     for _, other in ipairs(window.tabOrder) do
         if other == self then
-            Anim.tween(other.pill, 0.26, {
-                BackgroundTransparency = math.max(0, 0.66 - Theme.Transparency),
-            }, Anim.Ease.soft)
-            Anim.tween(other.pillStroke, 0.26, { Transparency = 0.45, Color = Theme.Accent }, Anim.Ease.soft)
-            -- Same NumberSequence trap as the notification gradient: show or hide
-            -- the pill's gradient by toggling the instance, never by tweening a
-            -- numeric Transparency onto it.
-            other.pillGradient.Enabled = Theme.GradientMode
+            Anim.tween(other.pill, 0.26, { BackgroundTransparency = 1 }, Anim.Ease.soft)
+            Anim.tween(other.pillStroke, 0.26, { Transparency = 1 }, Anim.Ease.soft)
+            other.pillGradient.Enabled = false
             if other.pillLabel then
                 Anim.tween(other.pillLabel, 0.24, { TextColor3 = Theme.Text }, Anim.Ease.soft)
             end
@@ -5705,6 +6360,7 @@ function Tab:select(noAnimation)
 
     -- cross-fade the pages
     if previous and previous ~= self then
+        previous:setFadesVisible(false)
         local old = previous.page
         if noAnimation then
             old.Visible = false
@@ -5722,6 +6378,7 @@ function Tab:select(noAnimation)
     end
 
     self.page.Visible = true
+    self:setFadesVisible(true)
     if noAnimation then
         self.page.Position = UDim2.fromScale(0, 0)
     else
@@ -5749,7 +6406,9 @@ function Tab:recolour()
     self.pill.BackgroundColor3 = Theme.BackgroundTertiary
     self.pillGlow.BackgroundColor3 = Theme.Accent
     self.pillGradient.Color = seq(Theme.Accent, Theme.AccentSecondary)
-    self.pillGradient.Enabled = Theme.GradientMode and self:isActive()
+    -- The shared RailSel indicator carries the active highlight now; pills
+    -- themselves stay clear so a theme change cannot double-paint them.
+    self.pillGradient.Enabled = false
     self.pillStroke.Color = self:isActive() and Theme.Accent or Theme.Border
     self.pillLabel.TextColor3 = self:isActive() and Theme.Text or Theme.SubText
     for _, child in ipairs(self.iconHolder:GetDescendants()) do
@@ -5787,6 +6446,8 @@ function Tab:destroy()
     end
     self.pill:Destroy()
     self.page:Destroy()
+    if self.fadeTop then self.fadeTop:Destroy() end
+    if self.fadeBottom then self.fadeBottom:Destroy() end
 end
 
 -- ═══════════════════════════════════════════════════════════════════════════
@@ -5823,27 +6484,53 @@ function Section.new(tab, props)
     self.corner = Build.corner(self.shell, Theme.Corner)
     self.stroke = Build.stroke(self.shell, Theme.Border, 1, 0.65)
 
+    -- Material pass: gradient edge ring + inner top light (gradient mode).
+    -- These live on the shell, which deliberately owns NO UIListLayout and NO
+    -- AutomaticSize: a scale-height child inside a list layout (or inside an
+    -- auto-sized parent) is counted as a row and ballooned the whole section
+    -- into one giant slab. The shell's height instead tracks the body below.
+    self.sheenRing, self.sheenLight = addCardSheen(self.shell)
+
+    -- Inner body owns the layout + padding and self-sizes; the shell mirrors
+    -- its height through a size signal (one concrete offset, no circularity).
+    local body = Build.frame(self.shell, {
+        name = "SectionBody",
+        size = UDim2.new(1, 0, 0, 0),
+        transparency = 1,
+        zindex = 4,
+    })
+    body.BackgroundTransparency = 1
+
     local layout = Instance.new("UIListLayout")
     layout.FillDirection = Enum.FillDirection.Vertical
     layout.SortOrder = Enum.SortOrder.LayoutOrder
     layout.Padding = UDim.new(0, 6)
-    layout.Parent = self.shell
+    layout.Parent = body
 
     local pad = Instance.new("UIPadding")
     pad.PaddingTop = UDim.new(0, 12)
     pad.PaddingBottom = UDim.new(0, 12)
     pad.PaddingLeft = UDim.new(0, 13)
     pad.PaddingRight = UDim.new(0, 13)
-    pad.Parent = self.shell
+    pad.Parent = body
 
     -- AutomaticSize is a *property*, not a creatable instance. Calling
     -- Instance.new("AutomaticSize") throws "Unable to create an Instance of
     -- type AutomaticSize" and aborts the entire loading stage.
-    self.shell.AutomaticSize = Enum.AutomaticSize.Y
-    self.shell.Size = UDim2.new(1, 0, 0, 0)
+    body.AutomaticSize = Enum.AutomaticSize.Y
+    self.body = body
+
+    self._sizeConn = body:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+        if self.shell and self.shell.Parent then
+            self.shell.Size = UDim2.new(1, 0, 0, body.AbsoluteSize.Y)
+        end
+    end)
+
+    -- Seed the mirror now; the signal re-fires on every later layout pass.
+    self.shell.Size = UDim2.new(1, 0, 0, body.AbsoluteSize.Y)
 
     if hasHeader then
-        local headerRow = Build.frame(self.shell, {
+        local headerRow = Build.frame(body, {
             name = "SectionHeader",
             size = UDim2.new(1, 0, 0, self.description ~= "" and 34 or 20),
             transparency = 1,
@@ -5876,6 +6563,10 @@ function Section.new(tab, props)
             textOffset = 24
         end
 
+        -- Accent tick beside the title; text indents around it.
+        addAccentTick(headerRow, textOffset)
+        textOffset = textOffset + 11
+
         Build.text(headerRow, {
             name = "Title",
             text = self.title,
@@ -5903,7 +6594,7 @@ function Section.new(tab, props)
         end
     end
 
-    self.contentHolder = self.shell
+    self.contentHolder = body
 
     return self
 end
@@ -5931,6 +6622,63 @@ function Section:recolour()
     self.corner.CornerRadius = UDim.new(0, Theme.Corner)
 end
 
+-- Rayfield Gen 2 parity: sections can be hidden and destroyed at runtime.
+-- Invisible children STILL occupy their UIListLayout slot, so hiding has to
+-- collapse the shell to zero height as well, or a gap remains where the
+-- section was. The shell has no AutomaticSize (see Section.new), so the
+-- collapse is just its mirrored height going to zero.
+function Section:setVisible(visible)
+    if visible == nil then visible = true end
+    visible = visible == true
+    local shell = self.shell
+    if shell then
+        if visible then
+            shell.Size = UDim2.new(1, 0, 0, (self.body and self.body.AbsoluteSize.Y) or 0)
+            shell.Visible = true
+        else
+            shell.Size = UDim2.new(1, 0, 0, 0)
+            shell.Visible = false
+        end
+    end
+    return visible
+end
+Section.SetVisible = Section.setVisible
+
+function Section:Destroy()
+    if self.__destroyed then return end
+    self.__destroyed = true
+
+    if self._sizeConn then
+        pcall(function() self._sizeConn:Disconnect() end)
+        self._sizeConn = nil
+    end
+
+    -- Tear down every element first so keybind listeners, dropdown panels
+    -- and flag registrations go with them.
+    for _, element in ipairs(self.elements or {}) do
+        if type(element) == "table" and element.Destroy then
+            pcall(function() element:Destroy() end)
+        end
+    end
+
+    local tab = self.tab
+    local window = tab and tab.window
+    if window then
+        for i = #window.searchIndex, 1, -1 do
+            if window.searchIndex[i].section == self or window.searchIndex[i].group == self then
+                table.remove(window.searchIndex, i)
+            end
+        end
+    end
+    if tab and tab.sections then
+        for i = #tab.sections, 1, -1 do
+            if tab.sections[i] == self then table.remove(tab.sections, i) end
+        end
+    end
+
+    if self.shell and self.shell.Parent then self.shell:Destroy() end
+end
+
 -- ═══════════════════════════════════════════════════════════════════════════
 --  COMPONENT INFRASTRUCTURE
 -- ═══════════════════════════════════════════════════════════════════════════
@@ -5951,30 +6699,40 @@ local function createRow(section, props, options)
     })
     row.BackgroundTransparency = 1
 
+    -- The cursor spotlight tracks every row; the glow itself is built lazily
+    -- the first time the pointer actually visits the row.
+    Spotlight.register(row)
+
     local labelOffset = 0
     if props.icon or props.Icon then
-        local iconHolder = Build.frame(row, {
-            size = UDim2.fromOffset(15, 15),
-            position = UDim2.new(0, 0, 0.5, 0),
-            anchor = Vector2.new(0, 0.5),
-            transparency = 1,
-            zindex = 7,
-        })
-        iconHolder.BackgroundTransparency = 1
+        -- The chip halo is slightly larger than the row; clip it here rather
+        -- than waiting for the spotlight to enable clipping on first hover.
+        row.ClipsDescendants = true
+        local chip = buildIconChip(row)
         local resolved = normaliseAsset(props.icon or props.Icon)
         if resolved then
             local img = Instance.new("ImageLabel")
             img.BackgroundTransparency = 1
-            img.Size = UDim2.fromScale(1, 1)
+            img.Size = UDim2.fromOffset(14, 14)
+            img.Position = UDim2.fromScale(0.5, 0.5)
+            img.AnchorPoint = Vector2.new(0.5, 0.5)
             img.Image = resolved
+            img.ImageColor3 = Theme.AccentSoft
             img.Visible = false
-            img.Parent = iconHolder
+            img.ZIndex = 7
+            img.Parent = chip
             img.Loaded:Connect(function() img.Visible = true end)
         else
-            Glyph.new(iconHolder, Glyph.resolve(props.icon or props.Icon, "grid"),
-                14, Theme.SubText, 0.2, 1.5, false)
+            local glyph = Glyph.new(chip, Glyph.resolve(props.icon or props.Icon, "grid"),
+                14, Theme.AccentSoft, 0.15, 1.5, false)
+            -- Glyph parts default to ZIndex 1; inside the lit chip (ZIndex 6)
+            -- they would draw behind the chip's own background.
+            glyph.ZIndex = 7
+            for _, part in ipairs(glyph:GetChildren()) do
+                part.ZIndex = 7
+            end
         end
-        labelOffset = 22
+        labelOffset = 34
     end
 
     local label = Build.text(row, {
@@ -6096,6 +6854,33 @@ local function applyLockable(handle, row, visualParts)
     end
 end
 
+-- Runtime removal. Every value element gets a `Destroy()` that tears down its
+-- row, unregisters its flag and prunes the search index, mirroring Rayfield
+-- Gen 2 (window:Destroy() already wipes everything; this makes individual
+-- elements disposable too). `cleanup` runs first and is for element-local
+-- bookkeeping such as disconnecting global listeners (keybinds).
+local function attachDestroy(handle, row, cleanup)
+    handle.__row = row
+    function handle:Destroy()
+        if self.__destroyed then return end
+        self.__destroyed = true
+        if cleanup then pcall(cleanup) end
+        if self.flag and State.Elements[self.flag] == self then
+            State.Elements[self.flag] = nil
+        end
+        local window = State.Window
+        if window then
+            for i = #window.searchIndex, 1, -1 do
+                local entry = window.searchIndex[i]
+                if entry.element == self or entry.label == self then
+                    table.remove(window.searchIndex, i)
+                end
+            end
+        end
+        if row and row.Parent then row:Destroy() end
+    end
+end
+
 -- ═══════════════════════════════════════════════════════════════════════════
 --  TOGGLE
 -- ═══════════════════════════════════════════════════════════════════════════
@@ -6109,8 +6894,10 @@ function Section:CreateToggle(props)
 
     local row, label = createRow(self, props, { rightPad = 70 })
 
+    -- Named "Switch" (not "Track") so the theme repaint's slider-track rule
+    -- cannot flatten its ON-state accent fill.
     local track = Build.frame(row, {
-        name = "Track",
+        name = "Switch",
         size = UDim2.fromOffset(42, 22),
         position = UDim2.new(1, -42, 0.5, 0),
         anchor = Vector2.new(0, 0.5),
@@ -6168,6 +6955,8 @@ function Section:CreateToggle(props)
 
     local function paint(state, animate)
         local duration = animate == false and 0.01 or 0.26
+        -- The theme repaint reads this so ON switches keep their accent fill.
+        track:SetAttribute("nc_on", state and true or false)
         if state then
             Anim.tween(track, duration, { BackgroundColor3 = Theme.Accent, BackgroundTransparency = 0.05 }, Anim.Ease.soft)
             Anim.tween(knob, duration, {
@@ -6223,6 +7012,7 @@ function Section:CreateToggle(props)
     paint(value, false)
 
     registerElement(self, handle, props, "toggle")
+    attachDestroy(handle, row)
     return handle
 end
 
@@ -6385,6 +7175,7 @@ function Section:CreateButton(props)
     end))
 
     applyLockable(handle, row, { plate })
+    attachDestroy(handle, row)
     handle.Set = function() end
     handle.__apply = function() end
 
@@ -6475,11 +7266,16 @@ function Section:CreateSlider(props)
     })
 
     local trackHeight = 4
+    -- The row clips descendants (cursor spotlight / chip halos need it), so a
+    -- full-width track let the row edge shave the knob in half at 0% and 100%.
+    -- Inset the track by the knob's radius on each side; the grab hitbox below
+    -- is widened back out so the touch target loses nothing.
+    local trackInset = 10
     local track = Build.frame(row, {
         name = "Track",
-        size = UDim2.new(1, 0, 0, trackHeight),
+        size = UDim2.new(1, -trackInset * 2, 0, trackHeight),
         -- Keep the track below the label so the knob never covers the text.
-        position = UDim2.new(0, 0, 0, props.description and 44 or 32),
+        position = UDim2.new(0, trackInset, 0, props.description and 44 or 32),
         transparency = 1,
         zindex = 7,
     })
@@ -6524,9 +7320,10 @@ function Section:CreateSlider(props)
 
     -- Grab strip over the track only, not the whole row. The old row-wide
     -- hitbox meant pressing the label or the value readout started a drag.
+    -- It overhangs the inset track so the whole visible width still grabs.
     local hit = Build.hitbox(track, {
-        size = UDim2.new(1, 0, 0, 24),
-        position = UDim2.new(0, 0, 0.5, 0),
+        size = UDim2.new(1, trackInset * 2, 0, 24),
+        position = UDim2.new(0, -trackInset, 0.5, 0),
         anchor = Vector2.new(0, 0.5),
         zindex = 20,
     })
@@ -6654,6 +7451,7 @@ function Section:CreateSlider(props)
 
     applyLockable(handle, row, { knob, fill })
     registerElement(self, handle, props, "slider")
+    attachDestroy(handle, row)
 
     handle.__setRange = function(newMin, newMax)
         minimum, maximum = newMin, newMax
@@ -6729,6 +7527,7 @@ function Section:CreateDropdown(props)
     local multi = props.multi
     if multi == nil then multi = props.Multi end
     if multi == nil then multi = props.multiple or props.Multiple or props.allowMultiple or props.AllowMultiple end
+    if multi == nil then multi = props.multiSelect or props.MultiSelect end
     multi = multi == true
     local choices = optionsFrom(props.options or props.Options or {})
     local searchable = props.searchable
@@ -6736,6 +7535,12 @@ function Section:CreateDropdown(props)
     if searchable == nil then searchable = multi and false or (#choices > 7) end
 
     local placeholder = props.placeholder or props.Placeholder or "Select..."
+
+    -- Rayfield Gen 2 spells the starting selection as `value`; accept it as
+    -- an alias for `default` so both generations configure the same way.
+    if props.default == nil then
+        props.default = props.value or props.Value
+    end
 
     -- Resolve the starting selection.
     local selected = {}
@@ -7388,6 +8193,11 @@ function Section:CreateDropdown(props)
         end
     end)
 
+    attachDestroy(handle, row, function()
+        isOpen = false
+        if panel.Parent then panel:Destroy() end
+    end)
+
     return handle
 end
 
@@ -7590,6 +8400,281 @@ function Section:CreateInput(props)
         fieldStroke.Color = focused and Theme.AccentSoft or Theme.Border
     end
 
+    attachDestroy(handle, row, function()
+        if focused then
+            focused = false
+            State.Typing = false
+            textBox:ReleaseFocus()
+        end
+    end)
+
+    return handle
+end
+
+-- ═══════════════════════════════════════════════════════════════════════════
+--  KEYBIND
+--
+--  A rebindable key, Rayfield Gen 2 style. Click the plate, then press any
+--  key (or mouse button) to bind it. Backspace clears the binding, Escape
+--  cancels the capture and keeps the current one.
+--
+--  In the default tap mode the callback fires on every press: callback(key).
+--  With hold = true it fires callback(true) once the key has been held past
+--  `holdThreshold` seconds (default 0.2) and callback(false) on release, so
+--  a quick tap is ignored — the same contract Rayfield documents.
+-- ═══════════════════════════════════════════════════════════════════════════
+
+local function keybindName(bind)
+    if typeof(bind) ~= "EnumItem" then return "None" end
+    if bind.EnumType == Enum.UserInputType then
+        if bind == Enum.UserInputType.MouseButton1 then return "MB1" end
+        if bind == Enum.UserInputType.MouseButton2 then return "MB2" end
+        if bind == Enum.UserInputType.MouseButton3 then return "MB3" end
+    end
+    return bind.Name
+end
+
+-- Enum indexing throws on unknown names, so look members up defensively.
+local function enumByName(enum, name)
+    local ok, item = pcall(function() return enum[name] end)
+    if ok then return item end
+    return nil
+end
+
+local function normaliseKeybind(value)
+    if typeof(value) == "EnumItem" then return value end
+    if type(value) == "string" then
+        local key = enumByName(Enum.KeyCode, value)
+        if key then return key end
+        if value == "MB1" or value == "MouseButton1" then return Enum.UserInputType.MouseButton1 end
+        if value == "MB2" or value == "MouseButton2" then return Enum.UserInputType.MouseButton2 end
+        if value == "MB3" or value == "MouseButton3" then return Enum.UserInputType.MouseButton3 end
+        return enumByName(Enum.UserInputType, value)
+    end
+    return nil
+end
+
+local function keybindMatches(input, bind)
+    if typeof(bind) ~= "EnumItem" or bind == nil then return false end
+    if bind.EnumType == Enum.KeyCode then
+        return input.KeyCode == bind
+    end
+    if bind.EnumType == Enum.UserInputType then
+        return input.UserInputType == bind
+    end
+    return false
+end
+
+function Section:CreateKeybind(props)
+    props = props or {}
+    local hold = (props.hold or props.Hold) == true
+    local holdThreshold = tonumber(props.holdThreshold or props.HoldThreshold) or 0.2
+    if holdThreshold < 0 then holdThreshold = 0 end
+
+    local initial = normaliseKeybind(
+        props.value or props.Value or props.CurrentKeybind or props.default or props.Default
+    )
+    props.value = initial -- store the EnumItem so flags/persistence see it too
+
+    local row, label = createRow(self, props, { rightPad = 116, height = props.description and 46 or ROW_HEIGHT + 4 })
+
+    local plate = Build.button(row, {
+        name = "Field",
+        size = UDim2.fromOffset(96, 28),
+        position = UDim2.new(1, -96, 0, props.description and 16 or 3),
+        transparency = 1,
+        zindex = 10,
+    })
+    plate.BackgroundColor3 = Theme.BackgroundTertiary
+    plate.BackgroundTransparency = 0.2
+    plate.ClipsDescendants = true
+    plate.AutoButtonColor = false
+    Build.corner(plate, 7)
+    local plateStroke = Build.stroke(plate, Theme.Border, 1, 0.45)
+
+    local plateLabel = Build.text(plate, {
+        name = "ButtonLabel",
+        text = "None",
+        size = UDim2.new(1, -12, 1, 0),
+        position = UDim2.fromOffset(6, 0),
+        font = Enum.Font.GothamMedium,
+        textSize = 12,
+        color = Theme.Text,
+        align = Enum.TextXAlignment.Center,
+        zindex = 11,
+        truncate = Enum.TextTruncate.AtEnd,
+    })
+
+    local handle = {}
+    handle.mode = hold and "hold" or "tap"
+    handle.holdThreshold = holdThreshold
+
+    local capturing = false
+    local holding = false
+    local holdFired = false
+    local holdToken = 0
+
+    local function paint()
+        plateLabel.Text = capturing and "Press a key..." or keybindName(handle.value)
+    end
+
+    local function fireCallback(...)
+        if props.callback then task.spawn(props.callback, ...) end
+    end
+
+    -- Live listener: reacts to the bound key whenever it is pressed anywhere,
+    -- including while the interface is hidden (which is the whole point).
+    local beganConn = addConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
+        if State.Destroyed or capturing or handle.locked then return end
+        if State.Typing or State.CapturingKey then return end
+        local bind = handle.value
+        if bind == nil or not keybindMatches(input, bind) then return end
+        if gameProcessed then return end
+
+        if hold then
+            if holding then return end
+            holding = true
+            holdFired = false
+            holdToken = holdToken + 1
+            local token = holdToken
+            task.delay(holdThreshold, function()
+                if not holding or token ~= holdToken or State.Destroyed then return end
+                holdFired = true
+                fireCallback(true)
+            end)
+        else
+            fireCallback(bind)
+        end
+    end))
+
+    local endedConn = addConnection(UserInputService.InputEnded:Connect(function(input)
+        if State.Destroyed or not holding then return end
+        if not keybindMatches(input, handle.value) then return end
+        holding = false
+        holdToken = holdToken + 1
+        if holdFired then fireCallback(false) end
+        holdFired = false
+    end))
+
+    plate.MouseEnter:Connect(function()
+        Anim.tween(plate, 0.18, { BackgroundTransparency = 0.1 }, Anim.Ease.soft)
+        Anim.tween(plateStroke, 0.18, { Transparency = 0.3 }, Anim.Ease.soft)
+    end)
+    plate.MouseLeave:Connect(function()
+        if capturing then return end
+        Anim.tween(plate, 0.18, { BackgroundTransparency = 0.2 }, Anim.Ease.soft)
+        Anim.tween(plateStroke, 0.18, { Transparency = 0.45 }, Anim.Ease.soft)
+    end)
+
+    -- Capture flow: click the plate to arm, next key/mouse press is the bind.
+    plate.MouseButton1Click:Connect(function()
+        if handle.locked then return end
+        if capturing then
+            capturing = false
+            State.CapturingKey = false
+            Anim.tween(plateStroke, 0.2, { Color = Theme.Border, Transparency = 0.45 }, Anim.Ease.soft)
+            paint()
+            return
+        end
+        capturing = true
+        State.CapturingKey = true
+        Anim.tween(plateStroke, 0.2, { Color = Theme.AccentSoft, Transparency = 0.1 }, Anim.Ease.soft)
+        paint()
+    end)
+
+    local captureConn = addConnection(UserInputService.InputBegan:Connect(function(input)
+        if State.Destroyed or not capturing then return end
+
+        if input.UserInputType == Enum.UserInputType.Keyboard then
+            if input.KeyCode == Enum.KeyCode.Escape then
+                -- Cancel: keep the current binding, exactly like Rayfield.
+                capturing = false
+                State.CapturingKey = false
+            elseif input.KeyCode == Enum.KeyCode.Backspace then
+                -- Backspace clears the binding.
+                handle:Set(nil)
+                capturing = false
+                State.CapturingKey = false
+            else
+                handle:Set(input.KeyCode)
+                capturing = false
+                State.CapturingKey = false
+            end
+        elseif input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.MouseButton2
+            or input.UserInputType == Enum.UserInputType.MouseButton3 then
+            handle:Set(input.UserInputType)
+            capturing = false
+            State.CapturingKey = false
+        else
+            return
+        end
+        Anim.tween(plateStroke, 0.2, { Color = Theme.Border, Transparency = 0.45 }, Anim.Ease.soft)
+        paint()
+    end))
+
+    function handle:Set(newValue, skipChanged)
+        local bind = normaliseKeybind(newValue)
+        if bind == Enum.KeyCode.Escape or bind == Enum.KeyCode.Backspace then bind = nil end
+
+        -- Never allow binding the interface toggle key: it would make the
+        -- menu unreachable. Rayfield refuses the same way.
+        if bind and State.ToggleKey and bind == State.ToggleKey then
+            LIBRARY:Notify({
+                Title = "Keybind refused",
+                Content = keybindName(bind) .. " is the interface toggle key and cannot be rebound here.",
+                Type = "warning",
+                Duration = 3,
+            })
+            return self.value
+        end
+
+        holding = false
+        holdToken = holdToken + 1
+        holdFired = false
+
+        self.value = bind
+        State.Flags[self.flag] = bind
+        paint()
+
+        if not skipChanged then
+            if props.onChanged then task.spawn(props.onChanged, bind) end
+            LIBRARY:queueAutoSave()
+        end
+        return bind
+    end
+
+    function handle:Get()
+        return handle.value
+    end
+
+    handle.__apply = function(v)
+        handle:Set(v, true)
+    end
+
+    applyLockable(handle, row, { plate, plateLabel })
+    registerElement(self, handle, props, "keybind")
+    attachDestroy(handle, row, function()
+        if capturing then
+            capturing = false
+            State.CapturingKey = false
+        end
+        holding = false
+        holdToken = holdToken + 1
+        pcall(function() beganConn:Disconnect() end)
+        pcall(function() endedConn:Disconnect() end)
+        pcall(function() captureConn:Disconnect() end)
+    end)
+
+    handle.value = initial
+    State.Flags[handle.flag] = initial
+    handle.__refreshTheme = function()
+        plate.BackgroundColor3 = Theme.BackgroundTertiary
+        plateStroke.Color = Theme.Border
+        plateLabel.TextColor3 = Theme.Text
+    end
+
+    paint()
     return handle
 end
 
@@ -7849,6 +8934,10 @@ function Section:CreateGroup(props)
     self.section = section
     self.tab = section.tab
 
+    -- Register the group on its section so Section:Destroy tears the group
+    -- (and through it, every element, flag and search entry inside) down.
+    table.insert(section.elements, self)
+
     self.shell = Build.frame(section.contentHolder, {
         name = "Group_" .. self.title,
         size = UDim2.new(1, 0, 0, 0),
@@ -7900,17 +8989,25 @@ function Section:CreateGroup(props)
         Glyph.new(iconHolder, Glyph.resolve(groupIcon, "sparkle"), 14, Theme.AccentSoft, 0.15, 1.6, false)
     end
 
-    Build.text(header, {
+    -- Tracked uppercase label: Roblox has no letter-spacing property, so the
+    -- hierarchy comes from uppercase + weight + the accent-soft colour.
+    local groupTitle = Build.text(header, {
         name = "GroupTitle",
-        text = self.title,
+        text = tostring(self.title):upper(),
         size = UDim2.new(1, groupIcon and -40 or -18, 1, 0),
         position = UDim2.new(0, groupIcon and 22 or 0, 0, 0),
         font = Enum.Font.GothamBold,
-        textSize = 12,
-        color = Theme.SubText,
+        textSize = 11,
+        color = Theme.AccentSoft,
         align = Enum.TextXAlignment.Left,
         zindex = 7,
     })
+
+    registerDecor(function()
+        if not groupTitle.Parent then return false end
+        groupTitle.TextColor3 = Theme.AccentSoft
+        return true
+    end)
 
     local caretHolder = Build.frame(header, {
         name = "Caret",
@@ -7974,6 +9071,7 @@ function Section:CreateGroup(props)
     function self:CreateSlider(p) return self:_withHolder(Section.CreateSlider, Section, p) end
     function self:CreateDropdown(p) return self:_withHolder(Section.CreateDropdown, Section, p) end
     function self:CreateInput(p) return self:_withHolder(Section.CreateInput, Section, p) end
+    function self:CreateKeybind(p) return self:_withHolder(Section.CreateKeybind, Section, p) end
     function self:CreateLabel(p) return self:_withHolder(Section.CreateLabel, Section, p) end
     function self:CreateParagraph(p) return self:_withHolder(Section.CreateParagraph, Section, p) end
     function self:CreateDivider(p) return self:_withHolder(Section.CreateDivider, Section, p) end
@@ -8009,6 +9107,51 @@ function Group:recolour()
     if not self.shell or not self.shell.Parent then return end
     self.shell.BackgroundColor3 = Theme.BackgroundTertiary
     self.stroke.Color = Theme.Border
+end
+
+-- Rayfield Gen 2 parity: groups can be hidden and destroyed at runtime.
+-- Same slot-collapse rule as sections: an invisible child still holds its
+-- layout slot unless its size goes to zero.
+function Group:setVisible(visible)
+    if visible == nil then visible = true end
+    visible = visible == true
+    local shell = self.shell
+    if shell then
+        if visible then
+            shell.AutomaticSize = Enum.AutomaticSize.Y
+            shell.Size = UDim2.new(1, 0, 0, 0)
+            shell.Visible = true
+        else
+            shell.AutomaticSize = Enum.AutomaticSize.None
+            shell.Size = UDim2.new(1, 0, 0, 0)
+            shell.Visible = false
+        end
+    end
+    return visible
+end
+Group.SetVisible = Group.setVisible
+
+function Group:Destroy()
+    if self.__destroyed then return end
+    self.__destroyed = true
+
+    for _, element in ipairs(self.elements or {}) do
+        if type(element) == "table" and element.Destroy then
+            pcall(function() element:Destroy() end)
+        end
+    end
+
+    local tab = self.tab
+    local window = tab and tab.window
+    if window then
+        for i = #window.searchIndex, 1, -1 do
+            if window.searchIndex[i].group == self or window.searchIndex[i].section == self then
+                table.remove(window.searchIndex, i)
+            end
+        end
+    end
+
+    if self.shell and self.shell.Parent then self.shell:Destroy() end
 end
 
 -- ═══════════════════════════════════════════════════════════════════════════
@@ -8210,6 +9353,7 @@ function Window:runSearch(rawQuery)
             dropdown = "chevron",
             multi = "grid",
             input = "hash",
+            keybind = "crosshair",
             paragraph = "info",
         })[entry.kind or ""] or "sparkle"
         Glyph.new(kindHolder, kindGlyph, 12, Theme.Accent, 0.35, 1.6, false)
@@ -10271,7 +11415,13 @@ local function rayfieldProps(props)
     if p.callback == nil then p.callback = p.Callback end
 
     if p.value == nil then p.value = p.CurrentValue end
+    if p.value == nil then p.value = p.CurrentKeybind end
     if p.text == nil then p.text = p.Text or p.Content end
+
+    -- Keybind
+    if p.hold == nil then p.hold = p.Hold end
+    if p.holdThreshold == nil then p.holdThreshold = p.HoldThreshold end
+    if p.onChanged == nil then p.onChanged = p.OnChanged end
 
     -- Slider
     if type(p.Range) == "table" then
@@ -10283,6 +11433,7 @@ local function rayfieldProps(props)
     -- Dropdown
     if p.options == nil then p.options = p.Options end
     if p.multi == nil then p.multi = p.MultipleOptions end
+    if p.multi == nil then p.multi = p.multiSelect or p.MultiSelect end
     if p.placeholder == nil then p.placeholder = p.PlaceholderText end
     if p.searchable == nil then p.searchable = p.Searchable end
     if p.default == nil then
@@ -10305,8 +11456,8 @@ end
 for _, method in ipairs({
     "CreateToggle", "CreateSwitch", "CreateButton", "CreateSlider",
     "CreateDropdown", "CreateMultiDropdown", "CreateDropdownMulti",
-    "CreateInput", "CreateParagraph", "CreateLabel", "CreateDivider",
-    "CreateGroup", "Dropdown",
+    "CreateInput", "CreateKeybind", "CreateParagraph", "CreateLabel",
+    "CreateDivider", "CreateGroup", "Dropdown",
 }) do
     local original = Section[method]
     if original then
@@ -10327,8 +11478,8 @@ end
 for _, method in ipairs({
     "CreateToggle", "CreateSwitch", "CreateButton", "CreateSlider",
     "CreateDropdown", "CreateMultiDropdown", "CreateDropdownMulti",
-    "CreateInput", "CreateParagraph", "CreateLabel", "CreateDivider",
-    "CreateGroup", "Dropdown",
+    "CreateInput", "CreateKeybind", "CreateParagraph", "CreateLabel",
+    "CreateDivider", "CreateGroup", "Dropdown",
 }) do
     Tab[method] = function(self, ...)
         local section = currentSection(self)
