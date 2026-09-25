@@ -597,6 +597,10 @@ Theme = {
     -- once moved it stayed where it was dropped -- which read as the pill
     -- teleporting. Turn on with Settings > Behaviour > "Move the Show NC pill".
     PillDraggable       = false,
+    -- Show the on-screen ↑/↓ reorder buttons on every row. Off by default:
+    -- programmatic MoveTo* is the API, the buttons are an opt-in edit mode.
+    -- Toggle in Settings > Behaviour > "Reorder controls".
+    ReorderControls     = false,
 }
 
 local UI_SCALE_CONTAINER = nil
@@ -1144,6 +1148,12 @@ State.NotifyExpanded = false
 
 -- Appearance state that lives outside the Theme table.
 State.WindowIcon    = nil      -- resolved asset string, or nil for the NC mark
+
+-- Every Section/Group (and the Settings pseudo-section) registers here so
+-- saved element order from configs can find its list again next session.
+-- Declared up top: LIBRARY:snapshot() (defined early) reads ORDER_HOSTS.
+local ORDER_HOSTS = {}
+local DECO_COUNTER = 0
 State.IconOnly      = false    -- hide the wordmark, keep just the icon
 State.ShowText      = true     -- "Show NC" label on the floating pill
 State.ProfileHidden = false    -- profile panel collapsed via the eye toggle
@@ -1264,7 +1274,6 @@ function LIBRARY:snapshot()
         corner      = Theme.Corner,
         glow        = Theme.GlowIntensity,
         animSpeed   = Theme.AnimationSpeed,
-        windowIcon  = State.WindowIcon,
         iconOnly    = State.IconOnly,
         profileHidden = State.ProfileHidden,
         showText    = State.ShowText,
@@ -1273,8 +1282,24 @@ function LIBRARY:snapshot()
         notifyCap   = Theme.NotifyCap,
         perGameConfigs = Theme.PerGameConfigs ~= false,
         pillDraggable  = Theme.PillDraggable == true,
+        reorderControls = Theme.ReorderControls == true,
         trafficLights  = State.TrafficLights ~= false,
     }
+
+    -- Element order per section/group so reordered rows survive config saves.
+    local order = {}
+    for _, host in ipairs(ORDER_HOSTS) do
+        local key = host.__hostKey
+        local list = host.elements
+        if key and list and #list > 1 then
+            local keys = {}
+            for _, entry in ipairs(list) do
+                if entry.__key then table.insert(keys, entry.__key) end
+            end
+            if #keys > 1 then order[key] = keys end
+        end
+    end
+    data.order = order
 
     return data
 end
@@ -1326,7 +1351,6 @@ function LIBRARY:applySnapshot(data)
         if appearance.corner then LIBRARY:setCorner(appearance.corner, true) end
         if appearance.glow then LIBRARY:setGlow(appearance.glow, true) end
         if appearance.animSpeed then Theme.AnimationSpeed = appearance.animSpeed end
-        if appearance.windowIcon then LIBRARY:setWindowIcon(appearance.windowIcon, true) end
         if appearance.iconOnly ~= nil then LIBRARY:setIconMode(appearance.iconOnly, true) end
         if appearance.showText ~= nil then LIBRARY:setShowPillMode(appearance.showText, true) end
         if appearance.toggleKey ~= nil then LIBRARY:setToggleKey(appearance.toggleKey, true) end
@@ -1339,10 +1363,23 @@ function LIBRARY:applySnapshot(data)
         if appearance.pillDraggable ~= nil then
             LIBRARY:setPillDraggable(appearance.pillDraggable, true)
         end
+        if appearance.reorderControls ~= nil then
+            LIBRARY:setReorderControls(appearance.reorderControls, true)
+        end
         if appearance.trafficLights ~= nil then
             LIBRARY:setTrafficLights(appearance.trafficLights, true)
         end
         if appearance.profileHidden ~= nil then LIBRARY:setProfileVisible(not appearance.profileHidden, true) end
+    end
+
+    -- Reordered rows: apply now when hosts exist (runtime config load), and
+    -- stash for the end of the build when this runs during Init's auto-load
+    -- (sections do not exist yet at that point).
+    if type(data.order) == "table" then
+        State.PendingOrder = data.order
+        if LIBRARY._applySavedOrder then
+            pcall(LIBRARY._applySavedOrder, data.order)
+        end
     end
 
     return true
@@ -1990,6 +2027,7 @@ end
 
 local notifyOverflow = nil   -- off-screen parking frame for hidden cards
 local notifyChip = nil       -- the "+N more" button
+local notifyChipLabel = nil  -- its caption (Instances can't hold Lua fields)
 
 local function ensureNotifyOverflow()
     if notifyOverflow and notifyOverflow.Parent then return notifyOverflow end
@@ -2090,7 +2128,7 @@ local function refreshNotifyQueue()
             refreshNotifyQueue()
         end)
 
-        notifyChip.__label = chipLabel
+        notifyChipLabel = chipLabel
         -- The stack grows upward from the corner; the "+N more" chip stands
         -- for the OLDEST parked cards, so it sits above them, not below the
         -- newest toast.
@@ -2098,8 +2136,8 @@ local function refreshNotifyQueue()
     end
 
     notifyChip.Parent = stack
-    if notifyChip.__label then
-        notifyChip.__label.Text = "+" .. tostring(hiddenCount) .. " more"
+    if notifyChipLabel then
+        notifyChipLabel.Text = "+" .. tostring(hiddenCount) .. " more"
     end
 end
 
@@ -6468,6 +6506,8 @@ function Section.new(tab, props)
     self.icon = props.icon or props.Icon
     self.collapsed = false
     self.elements = {}
+    self.__hostKey = ((tab and tab.name) or "") .. "|" .. self.title
+    table.insert(ORDER_HOSTS, self)
 
     local hasHeader = self.title ~= "" or self.description ~= ""
 
@@ -6603,18 +6643,20 @@ function Section:addElement(handle, searchMetadata)
     if not handle then return end
     table.insert(self.elements, handle)
 
-    if searchMetadata then
+    -- The Settings panel reuses Section with a pseudo-tab that has no
+    -- select(); keep its rows out of global search (jumpToResult would
+    -- try to switch to a tab that does not exist).
+    if searchMetadata and self.tab and self.tab.select then
         searchMetadata.tab = self.tab
         searchMetadata.section = self
         searchMetadata.element = handle
         table.insert(self.tab.window.searchIndex, searchMetadata)
     end
 
-    if handle.__container then
+    if handle.__container and self.tab and self.tab.select then
         table.insert(self.tab.window.searchIndex, handle.__container)
     end
 end
-
 function Section:recolour()
     if not self.shell or not self.shell.Parent then return end
     self.shell.BackgroundColor3 = Theme.BackgroundSecondary
@@ -6686,6 +6728,81 @@ end
 local ROW_HEIGHT = 34
 
 -- Shared row chrome: label, optional description, right-hand control slot.
+-- ═══════════════════════════════════════════════════════════════════════════
+--  REORDER CLUSTER — the on-screen ↑/↓ buttons rows get when
+--  Settings > Behaviour > "Reorder controls" is on. Built for touch:
+--  24px squares, always visible while the mode is on (no hover on mobile).
+-- ═══════════════════════════════════════════════════════════════════════════
+
+local REORDER_ROWS = {}
+local REORDER_WIDTH = 54
+
+-- Roblox Instances reject arbitrary Lua fields (`row.__reorder = ...` throws
+-- "__reorder is not a valid member of Frame" on a real executor), so the
+-- cluster entry for each row lives in this weak-keyed side table instead.
+local REORDER_BY_ROW = setmetatable({}, { __mode = "k" })
+
+local function applyReorderLayout(entry, on)
+    local extra = on and REORDER_WIDTH or 0
+    entry.cluster.Visible = on
+    for _, s in ipairs(entry.shifts) do
+        s.inst.Position = UDim2.new(0, s.baseX + extra, s.py or 0, s.y or 0)
+        -- Fixed-size instances (icon chip, halo) only slide; labels resize.
+        if not s.fixed then
+            s.inst.Size = UDim2.new(1, -(s.wOff + extra), 0, s.h)
+        end
+    end
+end
+
+local function buildReorderCluster(row)
+    local cluster = Build.frame(row, {
+        name = "ReorderCluster",
+        size = UDim2.fromOffset(50, 26),
+        position = UDim2.new(0, 0, 0.5, 0),
+        anchor = Vector2.new(0, 0.5),
+        transparency = 1,
+        -- Above the lit icon chip and its halo so the buttons can never be
+        -- hidden underneath the icon while the mode is on.
+        zindex = 12,
+    })
+    cluster.BackgroundTransparency = 1
+    cluster.Visible = Theme.ReorderControls == true
+
+    -- A rotated "v" reads as a chevron in every font Roblox ships; parent
+    -- Rotation would not work because GUI children ignore a parent's spin.
+    local function arrow(x, up, name)
+        local b = Build.button(cluster, {
+            name = name,
+            size = UDim2.fromOffset(24, 24),
+            position = UDim2.fromOffset(x, 1),
+            zindex = 13,
+        })
+        b.BackgroundColor3 = Theme.BackgroundTertiary
+        b.BackgroundTransparency = 0.35
+        Build.corner(b, 7)
+        b.Text = "v"
+        b.Font = Enum.Font.GothamBold
+        b.TextSize = 13
+        b.TextColor3 = Theme.SubText
+        b.TextYAlignment = Enum.TextYAlignment.Center
+        b.TextXAlignment = Enum.TextXAlignment.Center
+        b.Rotation = up and 180 or 0
+        return b
+    end
+
+    local entry = {
+        row = row,
+        cluster = cluster,
+        shifts = {},
+        up = arrow(0, true, "ReorderUp"),
+        down = arrow(26, false, "ReorderDown"),
+    }
+
+    table.insert(REORDER_ROWS, entry)
+    REORDER_BY_ROW[row] = entry
+    return entry
+end
+
 local function createRow(section, props, options)
     props = type(props) == "table" and props or { name = tostring(props or "") }
     options = options or {}
@@ -6704,11 +6821,13 @@ local function createRow(section, props, options)
     Spotlight.register(row)
 
     local labelOffset = 0
+    local iconChip
     if props.icon or props.Icon then
         -- The chip halo is slightly larger than the row; clip it here rather
         -- than waiting for the spotlight to enable clipping on first hover.
         row.ClipsDescendants = true
         local chip = buildIconChip(row)
+        iconChip = chip
         local resolved = normaliseAsset(props.icon or props.Icon)
         if resolved then
             local img = Instance.new("ImageLabel")
@@ -6765,16 +6884,225 @@ local function createRow(section, props, options)
         })
     end
 
+    -- On-screen reorder buttons; wired to the handle in registerElement and
+    -- shown/hidden (with the label shift) by LIBRARY:setReorderControls.
+    local reorderEntry = buildReorderCluster(row)
+    table.insert(reorderEntry.shifts, {
+        inst = label,
+        baseX = labelOffset,
+        wOff = (options.rightPad or 120) + labelOffset,
+        h = hasDescription and 16 or 18,
+        y = hasDescription and 4 or 8,
+    })
+    if description then
+        table.insert(reorderEntry.shifts, {
+            inst = description,
+            baseX = labelOffset,
+            wOff = (options.rightPad or 120),
+            h = 14,
+            y = 21,
+        })
+    end
+    -- Slide the icon chip (and its halo) past the cluster too, so the
+    -- buttons never sit on top of the icon.
+    if iconChip then
+        table.insert(reorderEntry.shifts, { inst = iconChip, baseX = 0, py = 0.5, fixed = true })
+        local chipGlow = row:FindFirstChild("ChipGlow")
+        if chipGlow then
+            table.insert(reorderEntry.shifts, { inst = chipGlow, baseX = 13, py = 0.5, fixed = true })
+        end
+    end
+    applyReorderLayout(reorderEntry, Theme.ReorderControls == true)
+
     return row, label, description
 end
 
 -- Registration shared by every value element so flags, saving and search
 -- all behave the same way.
+-- ═══════════════════════════════════════════════════════════════════════════
+--  REORDER API  (Rayfield Gen2 parity: MoveTo / MoveToTop / MoveUp / ...)
+--
+--  Rows live in a UIListLayout sorted by LayoutOrder, so "moving" an element
+--  is just rewriting order numbers on its section/group list. The rows then
+--  slide to their new slots with a FLIP animation: remember where everything
+--  was, let the layout re-flow, push each row back to its old spot and spring
+--  it home.
+-- ═══════════════════════════════════════════════════════════════════════════
+
+local function reorderVisual(handle)
+    return handle.row or handle.shell
+end
+
+local function relayoutList(list)
+    for index, entry in ipairs(list) do
+        local visual = reorderVisual(entry)
+        if visual then visual.LayoutOrder = index end
+    end
+end
+
+-- Decorative frames (dividers, paragraphs) are not operable elements, but
+-- they still need a LayoutOrder so they keep their creation position once
+-- siblings start carrying explicit orders.
+function Section:trackFrame(frame)
+    if not frame then return end
+    DECO_COUNTER = DECO_COUNTER + 1
+    local entry = { row = frame, __key = "__deco" .. DECO_COUNTER }
+    table.insert(self.elements, entry)
+    relayoutList(self.elements)
+end
+
+-- FLIP pass. The list layout is forced to commit the new order in this same
+-- frame (ApplyLayout); without that, a real executor still reports the old
+-- AbsolutePositions when we read them a step later, and rows snap to their
+-- new slot instead of sliding like the HTML preview.
+local function flipAnimate(list, before)
+    local firstVisual = reorderVisual(list[1])
+    local holder = firstVisual and firstVisual.Parent
+    if holder then
+        local layout = holder:FindFirstChildOfClass("UIListLayout")
+        if layout then pcall(function() layout:ApplyLayout() end) end
+    end
+
+    for _, entry in ipairs(list) do
+        local visual = reorderVisual(entry)
+        local y0 = before[entry]
+        if visual and visual.Parent and y0 then
+            local delta = y0 - visual.AbsolutePosition.Y
+            if math.abs(delta) > 0.5 then
+                local base = visual.Position
+                visual.Position = UDim2.new(base.X.Scale, base.X.Offset, base.Y.Scale, base.Y.Offset + delta)
+                Anim.tween(visual, 0.34, {
+                    Position = UDim2.new(base.X.Scale, base.X.Offset, base.Y.Scale, base.Y.Offset),
+                }, Anim.Ease.spring)
+            end
+        end
+    end
+end
+
+local function captureY(list)
+    local before = {}
+    for _, entry in ipairs(list) do
+        local visual = reorderVisual(entry)
+        if visual then before[entry] = visual.AbsolutePosition.Y end
+    end
+    return before
+end
+
+-- Restores an order saved by LIBRARY:snapshot(). Unknown entries keep their
+-- current relative position at the end of the list; the change animates with
+-- the same FLIP pass the on-screen reorder buttons use.
+local function applySavedOrder(order)
+    if type(order) ~= "table" then return end
+    for _, host in ipairs(ORDER_HOSTS) do
+        local key = host.__hostKey
+        local keys = key and order[key]
+        local list = host.elements
+        if keys and list and #list > 1 then
+            local before = captureY(list)
+
+            local byKey = {}
+            for _, entry in ipairs(list) do
+                local k = entry.__key
+                if k and not byKey[k] then byKey[k] = entry end
+            end
+
+            local nextList, seen = {}, {}
+            for _, savedKey in ipairs(keys) do
+                local entry = byKey[savedKey]
+                if entry and not seen[entry] then
+                    seen[entry] = true
+                    table.insert(nextList, entry)
+                end
+            end
+            for _, entry in ipairs(list) do
+                if not seen[entry] then table.insert(nextList, entry) end
+            end
+
+            for i = 1, #nextList do list[i] = nextList[i] end
+            for i = #nextList + 1, #list do list[i] = nil end
+
+            relayoutList(list)
+            flipAnimate(list, before)
+        end
+    end
+end
+LIBRARY._applySavedOrder = applySavedOrder
+
+local function moveHandle(handle, newIndex)
+    local host = handle.__host
+    local list = host and host.elements
+    if not list then return handle end
+
+    -- Forget destroyed siblings first so indexes stay honest.
+    for i = #list, 1, -1 do
+        local entry = list[i]
+        local visual = reorderVisual(entry)
+        if entry.__destroyed or (visual and not visual.Parent) then
+            table.remove(list, i)
+        end
+    end
+
+    local oldIndex
+    for i, entry in ipairs(list) do
+        if entry == handle then oldIndex = i break end
+    end
+    if not oldIndex then return handle end
+
+    newIndex = math.floor(tonumber(newIndex) or oldIndex)
+    newIndex = math.clamp(newIndex, 1, #list)
+    if newIndex == oldIndex then return handle end
+
+    local before = captureY(list)
+
+    table.remove(list, oldIndex)
+    table.insert(list, newIndex, handle)
+    relayoutList(list)
+
+    flipAnimate(list, before)
+    -- Order is part of the config now, so a move counts as a change.
+    LIBRARY:queueAutoSave()
+    return handle
+end
+
+local function applyReorderAPI(handle)
+    function handle:MoveTo(index) return moveHandle(self, index) end
+    function handle:MoveToTop() return moveHandle(self, 1) end
+    function handle:MoveToBottom()
+        local list = self.__host and self.__host.elements
+        return moveHandle(self, list and #list or 1)
+    end
+    function handle:MoveUp()
+        local list = self.__host and self.__host.elements
+        if list then
+            for i, entry in ipairs(list) do
+                if entry == self then return moveHandle(self, i - 1) end
+            end
+        end
+        return self
+    end
+    function handle:MoveDown()
+        local list = self.__host and self.__host.elements
+        if list then
+            for i, entry in ipairs(list) do
+                if entry == self then return moveHandle(self, i + 1) end
+            end
+        end
+        return self
+    end
+    -- Gen2 accepts both spellings.
+    handle.moveTo = handle.MoveTo
+    handle.moveToTop = handle.MoveToTop
+    handle.moveToBottom = handle.MoveToBottom
+    handle.moveUp = handle.MoveUp
+    handle.moveDown = handle.MoveDown
+end
+
 local function registerElement(section, handle, props, kind, extraSearch)
     local flag = props.flag or props.Flag or (props.name or props.Name or kind) .. "_" .. kind
     flag = tostring(flag)
 
     handle.flag = flag
+    handle.__key = flag -- stable per-script identity used by config order saving
     handle.kind = kind
     handle.name = props.name or props.Name or kind
     handle.description = props.description or props.Description or ""
@@ -6791,6 +7119,34 @@ local function registerElement(section, handle, props, kind, extraSearch)
         State.Flags[flag] = handle.value
     end
 
+    -- Reorder API bookkeeping: the section (or group proxy) owns the ordered
+    -- element list this handle can move around inside.
+    handle.__host = section
+    applyReorderAPI(handle)
+
+    -- On-screen ↑/↓ cluster (Settings > Behaviour > "Reorder controls").
+    local rc = handle.row and REORDER_BY_ROW[handle.row] or nil
+    if rc then
+        handle.__reorder = rc -- plain table field: safe, used by tests
+        local function press(btn)
+            -- Quick squash-and-spring so the tap itself reads as animated.
+            Anim.tween(btn, 0.08, { Size = UDim2.fromOffset(20, 20) }, Anim.Ease.soft)
+            task.delay(0.09, function()
+                Anim.tween(btn, 0.18, { Size = UDim2.fromOffset(24, 24) }, Anim.Ease.spring)
+            end)
+        end
+        rc.up.MouseButton1Click:Connect(function()
+            if handle.locked then return end
+            press(rc.up)
+            handle:MoveUp()
+        end)
+        rc.down.MouseButton1Click:Connect(function()
+            if handle.locked then return end
+            press(rc.down)
+            handle:MoveDown()
+        end)
+    end
+
     local tabName = section.tab and section.tab.name or ""
     if section.addElement then
         section:addElement(handle, {
@@ -6805,6 +7161,7 @@ local function registerElement(section, handle, props, kind, extraSearch)
             }, " "):lower(),
             label = handle,
         })
+        if section.elements then relayoutList(section.elements) end
     end
 
     if handle.__container then
@@ -6867,6 +7224,16 @@ local function attachDestroy(handle, row, cleanup)
         if cleanup then pcall(cleanup) end
         if self.flag and State.Elements[self.flag] == self then
             State.Elements[self.flag] = nil
+        end
+        local host = self.__host
+        if host and host.elements then
+            for i = #host.elements, 1, -1 do
+                if host.elements[i] == self then
+                    table.remove(host.elements, i)
+                    break
+                end
+            end
+            relayoutList(host.elements)
         end
         local window = State.Window
         if window then
@@ -7050,8 +7417,9 @@ function Section:CreateButton(props)
     })
     label.TextWrapped = true
 
+    local descLabel
     if hasDescription then
-        Build.text(row, {
+        descLabel = Build.text(row, {
             name = "Description",
             text = props.description or props.Description,
             size = UDim2.new(1, -130, 0, 14),
@@ -7064,6 +7432,17 @@ function Section:CreateButton(props)
             truncate = Enum.TextTruncate.None,
         })
     end
+
+    -- Same on-screen reorder cluster as createRow-built elements.
+    local reorderEntry = buildReorderCluster(row)
+    table.insert(reorderEntry.shifts, {
+        inst = label, baseX = 0, wOff = 130,
+        h = hasDescription and 16 or 18, y = hasDescription and 4 or 8,
+    })
+    if descLabel then
+        table.insert(reorderEntry.shifts, { inst = descLabel, baseX = 0, wOff = 130, h = 14, y = 21 })
+    end
+    applyReorderLayout(reorderEntry, Theme.ReorderControls == true)
 
     local buttonWidth = props.width or 104
     local plate = Build.frame(row, {
@@ -7179,6 +7558,22 @@ function Section:CreateButton(props)
     handle.Set = function() end
     handle.__apply = function() end
 
+    -- Buttons skip registerElement (they carry no value/flag state) but still
+    -- get the reorder API -- moving a button around is the headline use case.
+    handle.__host = self
+    applyReorderAPI(handle)
+
+    local rc = REORDER_BY_ROW[row]
+    if rc then
+        handle.__reorder = rc -- plain table field: safe, used by tests
+        rc.up.MouseButton1Click:Connect(function()
+            if not handle.locked then handle:MoveUp() end
+        end)
+        rc.down.MouseButton1Click:Connect(function()
+            if not handle.locked then handle:MoveDown() end
+        end)
+    end
+
     self:addElement(handle, {
         kind = "button",
         name = props.name or props.Name or "Button",
@@ -7186,6 +7581,7 @@ function Section:CreateButton(props)
         keywords = ((props.name or props.Name or "") .. " " .. (props.description or "") .. " " .. self.title):lower(),
         label = label,
     })
+    if self.elements then relayoutList(self.elements) end
     handle.__container = nil
 
     return handle
@@ -7282,6 +7678,21 @@ function Section:CreateSlider(props)
     track.BackgroundColor3 = Theme.BackgroundTertiary
     track.BackgroundTransparency = 0.25
     Build.corner(track, trackHeight / 2)
+
+    -- In reorder mode the ↑/↓ cluster owns the left edge of the row; slide
+    -- the track past it exactly like the label and icon chip, so the buttons
+    -- never sit on top of the rail.
+    local rcEntry = REORDER_BY_ROW[row]
+    if rcEntry then
+        table.insert(rcEntry.shifts, {
+            inst = track,
+            baseX = trackInset,
+            wOff = trackInset * 2,
+            h = trackHeight,
+            y = props.description and 44 or 32,
+        })
+        applyReorderLayout(rcEntry, Theme.ReorderControls == true)
+    end
 
     local fill = Build.frame(track, {
         name = "Fill",
@@ -8292,6 +8703,7 @@ function Section:CreateInput(props)
     end
 
     local handle = {}
+    handle.row = row
     handle.value = textBox.Text
     handle.input = textBox
 
@@ -8506,6 +8918,7 @@ function Section:CreateKeybind(props)
     })
 
     local handle = {}
+    handle.row = row
     handle.mode = hold and "hold" or "tap"
     handle.holdThreshold = holdThreshold
 
@@ -8812,8 +9225,12 @@ function Section:CreateParagraph(props)
         refresh()
     end
 
+    handle.row = row
+
     if props.flag or props.Flag then
         registerElement(self, handle, props, "paragraph")
+    elseif self.trackFrame then
+        self:trackFrame(row)
     end
 
     return handle
@@ -8846,6 +9263,7 @@ function Section:CreateLabel(props)
         truncate = Enum.TextTruncate.AtEnd,
     })
 
+    if self.trackFrame then self:trackFrame(row) end
     return row
 end
 
@@ -8905,6 +9323,7 @@ function Section:CreateDivider(props)
         })
     end
 
+    if self.trackFrame then self:trackFrame(row) end
     return row
 end
 
@@ -8933,10 +9352,16 @@ function Section:CreateGroup(props)
     self.collapsed = props.collapsed or false
     self.section = section
     self.tab = section.tab
+    self.__key = "__group:" .. self.title
+    self.__hostKey = (section.__hostKey or "") .. "|g:" .. self.title
+    table.insert(ORDER_HOSTS, self)
 
     -- Register the group on its section so Section:Destroy tears the group
     -- (and through it, every element, flag and search entry inside) down.
     table.insert(section.elements, self)
+    self.__host = section
+    applyReorderAPI(self)
+    relayoutList(section.elements)
 
     self.shell = Build.frame(section.contentHolder, {
         name = "Group_" .. self.title,
@@ -9086,12 +9511,12 @@ function Group:_withHolder(method, sectionProto, props)
         title = self.title,
         tab = self.tab,
         baseTransparency = 0.5,
-        elements = {},
+        elements = self.elements,
     }, { __index = sectionProto })
 
     host.addElement = function(_, handle, metadata)
         table.insert(self.elements, handle)
-        if metadata and self.tab then
+        if metadata and self.tab and self.tab.select then
             metadata.group = self
             metadata.tab = self.tab
             metadata.section = self
@@ -9917,8 +10342,9 @@ function Window:buildSettings()
         baseTransparency = 0.4,
         elements = {},
     }, { __index = Section })
+    settingsSection.__hostKey = "Settings|Settings"
+    table.insert(ORDER_HOSTS, settingsSection)
 
-    settingsSection.addElement = function() end
 
     local settingsTab = { name = "Settings", window = self, sections = {} }
     -- Settings elements use the same registration/search path as normal tabs.
@@ -10257,15 +10683,6 @@ function Window:buildSettings()
         callback = function(value) LIBRARY:setGlow(value) end,
     })
 
-    settingsSection:CreateSlider({
-        name = "Animation speed",
-        flag = "__nc_animspeed",
-        min = 0.5, max = 2, step = 0.05,
-        value = Theme.AnimationSpeed,
-        suffix = "x",
-        callback = function(value) LIBRARY:setAnimationSpeed(value) end,
-    })
-
     settingsSection:CreateDivider()
 
     settingsSection:CreateToggle({
@@ -10286,134 +10703,6 @@ function Window:buildSettings()
             })
         end,
     })
-
-    ----------------------------------------------------------------------
-    -- Window icon
-    ----------------------------------------------------------------------
-    local winIcon = settingsSection:CreateGroup({ name = "Window icon", icon = "image" })
-
-    settingsSection:CreateParagraph({
-        name = "",
-        text = "Paste a Roblox asset id (1234567), rbxassetid://, or a full URL. Leave empty to use the built-in NC mark.",
-        textSize = 11,
-    })
-
-    local iconInput = settingsSection:CreateInput({
-        name = "Icon asset",
-        placeholder = "rbxassetid://1234567",
-        clearable = true,
-        width = 130,
-    })
-
-    local iconActions = Build.frame(winIcon.contentHolder, {
-        name = "IconActions",
-        size = UDim2.new(1, 0, 0, 26),
-        transparency = 1,
-        zindex = 20,
-    })
-    iconActions.BackgroundTransparency = 1
-    local actionList = Instance.new("UIListLayout")
-    actionList.FillDirection = Enum.FillDirection.Horizontal
-    actionList.Padding = UDim.new(0, 6)
-    actionList.SortOrder = Enum.SortOrder.LayoutOrder
-    actionList.Parent = iconActions
-
-    local applyIcon = Build.button(iconActions, {
-        name = "ApplyIcon",
-        size = UDim2.fromOffset(92, 26),
-        -- Visible. Build.button defaults to transparency 1 and nothing restored
-        -- it, so this was an invisible tap target.
-        transparency = 0.12,
-        zindex = 21,
-    })
-    applyIcon.BackgroundColor3 = Theme.Accent
-    Build.corner(applyIcon, 7)
-    Build.text(applyIcon, {
-        name = "T",
-        text = "Apply icon",
-        size = UDim2.fromScale(1, 1),
-        font = Enum.Font.GothamMedium,
-        textSize = 11,
-        color = Theme.Text,
-        xalign = Enum.TextXAlignment.Center,
-        yalign = Enum.TextYAlignment.Center,
-        zindex = 22,
-    })
-
-    local resetIcon = Build.button(iconActions, {
-        name = "ResetIcon",
-        size = UDim2.fromOffset(62, 26),
-        transparency = 1,
-        zindex = 21,
-    })
-    resetIcon.BackgroundColor3 = Theme.BackgroundTertiary
-    resetIcon.BackgroundTransparency = 0.3
-    Build.corner(resetIcon, 7)
-    Build.text(resetIcon, {
-        name = "T",
-        text = "Reset",
-        size = UDim2.fromScale(1, 1),
-        font = Enum.Font.GothamMedium,
-        textSize = 11,
-        color = Theme.SubText,
-        xalign = Enum.TextXAlignment.Center,
-        yalign = Enum.TextYAlignment.Center,
-        zindex = 22,
-    })
-
-    applyIcon.MouseEnter:Connect(function()
-        Anim.tween(applyIcon, 0.16, { BackgroundColor3 = Theme.AccentSecondary }, Anim.Ease.soft)
-    end)
-    applyIcon.MouseLeave:Connect(function()
-        Anim.tween(applyIcon, 0.16, { BackgroundColor3 = Theme.Accent }, Anim.Ease.soft)
-    end)
-    applyIcon.MouseButton1Click:Connect(function()
-        local raw = iconInput.value or ""
-        if raw == "" then
-            LIBRARY:Notify({
-                Title = "Icon",
-                Content = "Enter an asset id first",
-                Type = "warning",
-                Duration = 3,
-            })
-            return
-        end
-        local ok, err = LIBRARY:setWindowIcon(raw)
-        if ok then
-            if self.headerIcon then self:setHeaderIcon(raw) end
-            LIBRARY:Notify({
-                Title = "Icon updated",
-                Content = "Window icon set to " .. tostring(raw),
-                Type = "success",
-                Duration = 3,
-            })
-        else
-            LIBRARY:Notify({
-                Title = "Icon failed",
-                Content = tostring(err or "Could not resolve that asset"),
-                Type = "error",
-                Duration = 3.5,
-            })
-        end
-    end)
-
-    resetIcon.MouseEnter:Connect(function()
-        Anim.tween(resetIcon, 0.16, { BackgroundTransparency = 0.1 }, Anim.Ease.soft)
-    end)
-    resetIcon.MouseLeave:Connect(function()
-        Anim.tween(resetIcon, 0.16, { BackgroundTransparency = 0.3 }, Anim.Ease.soft)
-    end)
-    resetIcon.MouseButton1Click:Connect(function()
-        LIBRARY:setWindowIcon(nil)
-        if self.headerIcon then self:setHeaderIcon(nil) end
-        iconInput:Set("", true)
-        LIBRARY:Notify({
-            Title = "Icon reset",
-            Content = "Back to the built-in NC mark",
-            Type = "info",
-            Duration = 3,
-        })
-    end)
 
     ----------------------------------------------------------------------
     -- Configs
@@ -10762,6 +11051,22 @@ function Window:buildSettings()
         end,
     })
 
+    settingsSection:CreateToggle({
+        name = "Reorder controls",
+        description = "Show touch-friendly up/down buttons on every row",
+        flag = "__nc_reorder",
+        value = Theme.ReorderControls == true,
+        callback = function(state)
+            LIBRARY:setReorderControls(state)
+            LIBRARY:Notify({
+                Title = "Reorder controls",
+                Content = state and "Every row now has up/down buttons" or "Reorder buttons hidden",
+                Type = "info",
+                Duration = 2.6,
+            })
+        end,
+    })
+
     settingsSection:CreateButton({
         name = "Unload interface",
         description = "Destroys the UI and releases all connections",
@@ -10775,7 +11080,6 @@ function Window:buildSettings()
     self.settingsScroller = scroller
     self.settingsHost = settingsSection
     self.configDropdown = configDropdown
-    self.iconInput = iconInput
 
     -- Give every registered plugin its group. This has to run after
     -- settingsHost is set, since mountPlugin resolves it from State.Window.
@@ -10871,6 +11175,31 @@ end
 --  NC:Window{}    get the window object for tab creation
 -- ═══════════════════════════════════════════════════════════════════════════
 
+-- ── public flag API (Rayfield Gen2 parity) ────────────────────────────────
+-- window.Flags is the LIVE flag table: read any element's value by name.
+-- Get/Set route through the owning element, so Set flips the on-screen
+-- control and fires its callback exactly like a real click would.
+LIBRARY.Flags = State.Flags
+
+function LIBRARY:Get(flag)
+    local handle = State.Elements[flag]
+    if handle and handle.value ~= nil then return handle.value end
+    return State.Flags[flag]
+end
+
+function LIBRARY:Set(flag, value)
+    local handle = State.Elements[flag]
+    if handle and type(handle.Set) == "function" then
+        handle:Set(value)
+    else
+        State.Flags[flag] = value
+    end
+    return value
+end
+
+LIBRARY.getFlag = LIBRARY.Get
+LIBRARY.setFlag = LIBRARY.Set
+
 LIBRARY.Name = "NC"
 LIBRARY.Version = "1.1.0"
 
@@ -10914,6 +11243,26 @@ function LIBRARY:setPillDraggable(enabled, silent)
     if State.ShowPill and State.ShowPill.setDraggable then
         State.ShowPill:setDraggable(Theme.PillDraggable)
     end
+    if not silent then LIBRARY:queueAutoSave() end
+end
+
+-- Shows or hides the on-screen ↑/↓ reorder buttons on every row.
+function LIBRARY:setReorderControls(enabled, silent)
+    Theme.ReorderControls = enabled and true or false
+    for _, entry in ipairs(REORDER_ROWS) do
+        if entry.row and entry.row.Parent then
+            applyReorderLayout(entry, Theme.ReorderControls)
+        end
+    end
+    -- Re-assert once the dust settles: anything that re-positioned row chrome
+    -- (theme refreshes, late sizing) gets overwritten back into place.
+    task.delay(0.1, function()
+        for _, entry in ipairs(REORDER_ROWS) do
+            if entry.row and entry.row.Parent then
+                applyReorderLayout(entry, Theme.ReorderControls)
+            end
+        end
+    end)
     if not silent then LIBRARY:queueAutoSave() end
 end
 
@@ -11025,9 +11374,18 @@ function LIBRARY:Init(config)
     if config.pillDraggable ~= nil then
         Theme.PillDraggable = config.pillDraggable and true or false
     end
+    if config.reorderControls ~= nil then
+        Theme.ReorderControls = config.reorderControls and true or false
+    end
     -- Mac-style window dots. On unless a script explicitly hides them.
     if config.trafficLights ~= nil then
         State.TrafficLights = config.trafficLights and true or false
+    end
+    -- The window icon is scripter-only (Rayfield-style `Icon`); it is not
+    -- editable from the Settings panel. 0 / "" mean "keep the NC mark".
+    local iconOpt = config.icon or config.Icon
+    if iconOpt ~= nil and iconOpt ~= 0 and iconOpt ~= "" then
+        LIBRARY:setWindowIcon(iconOpt, true)
     end
 
     -- Pull the saved appearance in BEFORE the loading screen is built.
@@ -11145,6 +11503,14 @@ function LIBRARY:Init(config)
             run = function()
                 if not window then return end
                 window:buildSettings()
+                -- The Init auto-load ran before any sections existed, so the
+                -- saved element order could not apply then; flush it now that
+                -- every row (settings included) is built.
+                if State.PendingOrder then
+                    local pending = State.PendingOrder
+                    State.PendingOrder = nil
+                    pcall(applySavedOrder, pending)
+                end
             end,
         },
 
