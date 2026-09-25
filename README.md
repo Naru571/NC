@@ -4,7 +4,7 @@ A single-file, dependency-free UI library for Roblox executor environments.
 Dark, purple-accented, heavily animated, and fully themeable at runtime.
 
 No dependencies. No asset ids. No external services. One file you load and build
-against — the entire library is ~10,000 lines of Lua, currently **Gen 1.1.0**.
+against — the entire library is ~11,000 lines of Lua, currently **Gen 1.3.0**.
 
 ---
 
@@ -72,6 +72,42 @@ The whole library follows one pattern: **window → tab → section → element*
 Everything else is detail on top of those four things.
 
 ---
+
+## What's new in Gen 1.3.0
+
+A material & light pass — same layout, same colours, better surfaces. See
+[Material and light](#material-and-light) for the full tour.
+
+- **Gradient border + inner top highlight** — section cards get a 1px gradient
+  ring and a hairline light across their top edge, so they read as physical
+  objects instead of painted rectangles. *(gradient mode only)*
+- **Gradient icon chips** — element icons sit in accent-tinted chips with an
+  inner highlight and a soft halo. *(gradient mode only — flat mode falls back
+  to a quiet bordered square)*
+- **Sliding tab indicator** — one shared pill glides between tabs (and previews
+  on hover) instead of each tab lighting itself.
+- **Scroll fade masks** — tab content dissolves at the top and bottom edges
+  instead of hard-clipping mid-row.
+- **Accent bar + tracked labels** — section titles get an accent tick; group
+  titles become uppercase accent-soft labels.
+- **Cursor spotlight** — a soft radial glow follows the pointer across element
+  rows.
+
+## What's new in Gen 1.2.0
+
+- **Keybind element** — a rebindable key row, Rayfield-Gen2 style. Click the
+  plate and press any key (or mouse button) to bind it; **Backspace** clears
+  the binding, **Escape** cancels. Supports a normal tap mode and a **hold
+  mode** (`hold = true`) that fires `callback(true)` once the key is held past
+  a threshold and `callback(false)` on release — quick taps are ignored.
+- **`Destroy()` everywhere** — elements, sections and groups can now be
+  removed at runtime (`handle:Destroy()`, `section:Destroy()`,
+  `group:Destroy()`), unregistering flags and search entries cleanly.
+- **`setVisible()` for sections and groups** — hide or show a whole block
+  without destroying it (`section:setVisible(false)`).
+- **`multiSelect` on `CreateDropdown`** — instead of a separate constructor,
+  pass `multiSelect = true` and a table `value` to pre-select several options.
+  `CreateMultiDropdown` still works as an alias.
 
 ## What's new in Gen 1.1.0
 
@@ -159,6 +195,8 @@ parts you need.
 ## Contents
 
 - [New here? Start in three steps](#new-here-start-in-three-steps)
+- [What's new in Gen 1.3.0](#whats-new-in-gen-130)
+- [What's new in Gen 1.2.0](#whats-new-in-gen-120)
 - [What's new in Gen 1.1.0](#whats-new-in-gen-110)
 - [Installation options](#installation-options)
 - [Window](#window)
@@ -168,6 +206,7 @@ parts you need.
 - [Value handles](#value-handles)
 - [Notifications](#notifications)
 - [Appearance](#appearance)
+- [Material and light](#material-and-light)
 - [Configs](#configs)
 - [Player info](#player-info)
 - [Show and hide keybind](#show-and-hide-keybind)
@@ -416,6 +455,27 @@ group:toggle()      -- collapse or expand, with animation
 group.collapsed     -- read the current state
 ```
 
+### Hiding and removing at runtime
+
+Sections and groups can be hidden or destroyed after they are built — useful
+for progressive disclosure, or for stripping features a user has not unlocked.
+
+```lua
+section:setVisible(false)   -- hide the whole section (SetVisible works too)
+section:setVisible(true)    -- show it again
+
+section:Destroy()           -- remove permanently: elements, flags, search
+group:setVisible(false)
+group:Destroy()
+```
+
+`setVisible` simply toggles visibility; the contents survive and reappear
+exactly as they were. `Destroy` is final — the section/group and everything
+inside it is removed, its flags are unregistered, and search results pointing
+at it are pruned so they never resolve to a dead block. Destroying a section
+also destroys every element inside it (so their keybind listeners and dropdown
+panels go with them).
+
 ---
 
 ## Elements
@@ -550,34 +610,40 @@ section:CreateDropdown({
 Options may be plain strings — `options = { "Corners", "Full box", "Filled" }` —
 in which case the label and the value are the same.
 
-| Prop          | Type     | Default       | Description                                                        |
-| ------------- | -------- | ------------- | ------------------------------------------------------------------ |
-| `options`     | table    | `{}`          | Strings, or `{ label, value }` tables. Alias: `Options`.           |
-| `default`     | any      | —             | Initially selected value. Aliases: `Default`, `CurrentOption`.     |
-| `multi`       | boolean  | `false`       | Allow multiple selections. Aliases: `Multiple`, `MultipleOptions`. |
-| `searchable`  | boolean  | auto          | Force the search field on or off.                                  |
-| `placeholder` | string   | `"Select..."` | Text when nothing is chosen.                                       |
-| `clearable`   | boolean  | `true`        | Offer a *Clear selection* row.                                     |
-| `width`       | number   | —             | Optional fixed width.                                              |
-| `callback`    | function | —             | `function(value)` — a table when `multi` is set.                   |
+| Prop          | Type     | Default       | Description                                                                          |
+| ------------- | -------- | ------------- | ------------------------------------------------------------------------------------ |
+| `options`     | table    | `{}`          | Strings, or `{ label, value }` tables. Alias: `Options`.                             |
+| `default`     | any      | —             | Initially selected value. Aliases: `Default`, `CurrentOption`, `value`, `Value`.     |
+| `multiSelect` | boolean  | `false`       | Allow multiple selections. Aliases: `multi`, `Multi`, `Multiple`, `MultipleOptions`. |
+| `searchable`  | boolean  | auto          | Force the search field on or off.                                                    |
+| `placeholder` | string   | `"Select..."` | Text when nothing is chosen.                                                         |
+| `clearable`   | boolean  | `true`        | Offer a *Clear selection* row.                                                       |
+| `width`       | number   | —             | Optional fixed width.                                                                |
+| `callback`    | function | —             | `function(value)` — a table when multi-selection is on.                              |
 
 #### Multi-select
 
+Prefer the single constructor with `multiSelect` — this is the Rayfield Gen 2
+shape:
+
 ```lua
-section:CreateMultiDropdown({
-    name = "Select players",
-    flag = "SelectedPlayers",
-    options = { "Player1", "Player2", "Player3", "Player4" },
-    default = {},
+tab:CreateDropdown({
+    name = "ESP features",
+    flag = "ESPFeatures",
+    multiSelect = true,
+    options = { "ESP", "Tracers", "Chams", "Skeletons" },
+    value = { "ESP" },                       -- initial selection (a table)
     callback = function(selected)
-        for _, name in ipairs(selected) do print(name) end
+        for _, feature in ipairs(selected) do print(feature) end
     end,
 })
 ```
 
-`CreateDropdownMulti` is an alias. Selecting does **not** close the list, several
-options stay highlighted with checkmarks, clicking again deselects, and a
-*Clear selection* row is provided.
+`CreateMultiDropdown` / `CreateDropdownMulti` do the same thing and stay
+available. Selecting does **not** close the list, several options stay
+highlighted with checkmarks, clicking again deselects, and a *Clear selection*
+row is provided. In multi mode `.value` and the callback argument are always a
+table of the selected values.
 
 #### Compact positional form
 
@@ -618,6 +684,72 @@ section:CreateInput({
 | `onEnter`     | function | —       | `function(text)` — fires when Enter is pressed.            |
 | `width`       | number   | —       | Optional fixed width.                                      |
 | `callback`    | function | —       | `function(text)`.                                          |
+
+---
+
+### Keybind
+
+A rebindable key, modelled on Rayfield Gen 2's keybind element. The row shows a
+plate with the current bind; click it and press any key (or mouse button) to
+bind. **Backspace** clears the binding, **Escape** cancels the capture and keeps
+whatever was bound before. Available on sections, groups and tabs.
+
+```lua
+section:CreateKeybind({
+    name = "Aimbot key",
+    description = "Hold to aim",
+    flag = "AimbotKey",
+    value = Enum.KeyCode.C,           -- initial bind
+    callback = function(key)
+        print("pressed:", key.Name)
+    end,
+})
+```
+
+**Hold mode** — with `hold = true` the callback fires `true` once the key has
+been held past `holdThreshold` seconds (default `0.2`) and `false` when it is
+released. Quick taps are ignored, exactly like Rayfield:
+
+```lua
+section:CreateKeybind({
+    name = "Fly key",
+    flag = "FlyKey",
+    value = Enum.KeyCode.F,
+    hold = true,
+    holdThreshold = 0.2,
+    callback = function(isHolding)
+        if isHolding then
+            startFlying()
+        else
+            stopFlying()
+        end
+    end,
+    onChanged = function(key)
+        print("rebound to", key and key.Name or "None")
+    end,
+})
+```
+
+| Prop            | Type                          | Default | Description                                                         |
+| --------------- | ----------------------------- | ------- | ------------------------------------------------------------------- |
+| `value`         | KeyCode \| UserInputType \| string | —   | Initial bind. Strings like `"C"` or `"MB2"` are accepted.           |
+| `hold`          | boolean                       | `false` | Hold-to-activate instead of fire-on-press.                          |
+| `holdThreshold` | number                        | `0.2`   | Seconds a key must be held before `callback(true)` fires.           |
+| `callback`      | function                      | —       | Tap: `function(key)`. Hold: `function(isHolding)`.                  |
+| `onChanged`     | function                      | —       | `function(key)` — fires when the bind itself changes.               |
+| `flag`          | string                        | —       | Persistence key; the bind is saved and restored with configs.       |
+
+The handle follows the standard contract, with one deliberate exception taken
+from Rayfield: `:Set(key)` fires `onChanged`, never the press callback. Binding
+the interface's toggle key is refused with a warning so the menu can never be
+locked out. Mouse buttons (`MB1`/`MB2`/`MB3`) are valid binds.
+
+```lua
+local bind = section:CreateKeybind({ name = "Panic key", value = Enum.KeyCode.P })
+bind:Set(Enum.KeyCode.K)          -- rebind programmatically
+bind:Set(nil)                     -- clear
+print(bind.value.Name)            -- current bind as an EnumItem
+```
 
 ---
 
@@ -685,6 +817,7 @@ handle:Get()                  -- explicit read
 handle:Lock("Unavailable")    -- block input and callback, show a reason
 handle:Unlock()
 handle:IsLocked()
+handle:Destroy()              -- remove the element entirely
 ```
 
 | Member                      | Description                                                |
@@ -695,7 +828,13 @@ handle:IsLocked()
 | `:Lock(reason)`             | Block interaction and show `reason` in place of the label. |
 | `:Unlock()`                 | Remove the lock.                                           |
 | `:IsLocked()`               | Whether it is currently locked.                            |
+| `:Destroy()`                | Remove the element: row, flag registration and search entries all go. |
 | `.flag`                     | The persistence key.                                       |
+
+`Destroy()` is permanent and idempotent — call it on toggles, buttons, sliders,
+dropdowns (panel included), inputs and keybinds (global listeners included)
+whenever a feature should disappear at runtime. Sections and groups have it
+too; see [Hiding and removing at runtime](#hiding-and-removing-at-runtime).
 
 Locking is how a script disables a control that does not apply right now — for
 example locking an aim slider while silent aim is off.
@@ -846,6 +985,64 @@ rather than leaving a blank square. The same field is in the Settings panel unde
 
 ---
 
+## Material and light
+
+Gen 1.3.0 adds a material pass: the layout and colours are unchanged, but
+surfaces now behave like physical objects. Everything here is automatic — no
+new props to pass.
+
+### Gradient border + inner top highlight *(gradient mode only)*
+
+Section cards are wrapped in a 1px gradient ring (accent → secondary → border,
+diagonal) and carry a hairline light along their top edge. The ring is a child
+frame one pixel larger than the card drawn one layer below it — no texture
+assets involved. Switch gradient mode off and both layers disappear, leaving
+the classic flat card and border.
+
+### Gradient icon chips *(gradient mode only)*
+
+Elements created with an `icon` now show it inside a 26px chip: an
+accent-to-secondary tint at 150°, a 1px inner highlight, an accent-soft stroke
+and glyph, and a soft halo behind it. In flat mode the chip falls back to a
+quiet bordered square. Icon rows are laid out around the chip automatically —
+nothing to configure.
+
+### Sliding tab indicator
+
+The nav rail has **one shared selection pill** that springs between tabs
+instead of each tab lighting itself. Hovering a tab previews the indicator on
+it; moving the mouse off the rail sends it home to the active tab. Switching
+tabs now feels like one object moving, not two fading. The pill follows your
+accent and flattens to a solid tint in flat mode.
+
+### Scroll fade masks
+
+Tab content dissolves over the last 26px at the top and bottom of the scroll
+area instead of clipping mid-row. The masks are coloured from the live
+background, track theme changes, and never capture input.
+
+### Accent bar + tracked labels
+
+Section titles get a 3px accent tick (accent-soft → secondary vertical
+gradient) and indent around it. Group titles render as uppercase, bold,
+accent-soft labels. Roblox text has no letter-spacing property, so the
+hierarchy comes from case, weight and colour rather than tracking.
+
+### Cursor spotlight
+
+A soft radial glow (built from the same nested-disc technique as the loading
+bloom — no textures) follows your pointer across element rows, fading in on
+hover and out when you leave. It works on every toggle, button, slider,
+dropdown, input and keybind row, in sections and in groups, and costs nothing
+on touch devices where the pointer never moves.
+
+**What follows gradient mode.** The ring, top light, chip gradients and halos,
+and the tick's gradient are on when `Theme.GradientMode` is on. The sliding
+indicator, scroll fades, spotlight and uppercase labels are always on — they
+are geometry and motion, not gradients.
+
+---
+
 ## Configs
 
 Save, load and delete named configurations. All values with a `flag` are included,
@@ -970,6 +1167,8 @@ How they behave:
   a notification spells out *"Red closes · Yellow minimises · Green zooms."*
   (No toasts on hover — those got noisy.)
 - The dots **pop in with a staggered scale animation** when they appear.
+- On touch screens the visible 12px circle sits on a bigger invisible tap
+  target, so the dots are finger-sized even though they look small.
 - The zoomed size is remembered across minimise/close, and re-fits itself if
   your viewport resizes while zoomed.
 
@@ -998,6 +1197,12 @@ destroyed, so restoring is instant and state is preserved.
 The pill has a pulsing halo, a drifting sheen, a slowly rotating sparkle and a
 gentle float, brightens on hover, and is clamped so it can never be lost
 offscreen. Clicking it restores the window.
+
+**Easy to grab on PC and mobile.** The visible pill sits inside a bigger
+invisible hitbox (~14px extra on every side), so it is simple to tap with a
+finger or catch with the mouse. The same click-vs-drag detection as before
+means a sloppy press still restores instead of moving it, and drags are
+clamped to the viewport — the pill can never be flung out of nowhere.
 
 **Dragging is off by default.** The pill is also the restore button, so a slightly
 imprecise click used to move it — and once moved it stayed put, which read as the
@@ -1056,10 +1261,13 @@ panel is built.
 ## Rayfield Gen2 compatibility
 
 Scripts written against Rayfield Gen2 run largely unchanged. `Name` / `Title`,
-`Flag`, `Callback`, `CurrentValue`, `Range`, `Increment`, `Options`,
-`CurrentOption`, `MultipleOptions`, `PlaceholderText`, `Content` and `Image` are
-all understood, and elements may be created straight on a `Tab` — landing in its
-most recent section — rather than on a `Section`.
+`Flag`, `Callback`, `CurrentValue`, `CurrentKeybind`, `Range`, `Increment`,
+`Options`, `CurrentOption`, `MultipleOptions`, `multiSelect`,
+`PlaceholderText`, `Content` and `Image` are all understood, and elements may
+be created straight on a `Tab` — landing in its most recent section — rather
+than on a `Section`. The Gen 2 runtime surface is covered too: `CreateKeybind`
+(with tap *and* hold modes), `multiSelect` on `CreateDropdown`, and
+`Destroy()` / `setVisible()` on elements, sections and groups.
 
 ```lua
 local Window = NC:CreateWindow({
@@ -1092,11 +1300,12 @@ NC:Notify({ Title = "Hi", Content = "Loaded", Duration = 3 })
 | `Flag`            | `flag`        |
 | `Callback`        | `callback`    |
 | `CurrentValue`    | `value`       |
+| `CurrentKeybind`  | `value` (keybinds) |
 | `Range = {a, b}`  | `min`, `max`  |
 | `Increment`       | `step`        |
 | `Options`         | `options`     |
 | `CurrentOption`   | `default`     |
-| `MultipleOptions` | `multi`       |
+| `MultipleOptions`, `multiSelect` | `multi` |
 | `PlaceholderText` | `placeholder` |
 | `Content`, `Text` | `text`        |
 
@@ -1188,13 +1397,30 @@ AST-based Lua parsers give false positives:
 python luacheck.py NC.lua        # -> OK NC.lua
 ```
 
+`smoke.lua` + `mock_roblox.lua` go one step further: they stub the Roblox API
+in plain Lua (with typed-property validation, so the `Color3 expected, got nil`
+crash class reproduces locally), run `NC:Init` end to end, assert the new
+features behave (keybinds, multiSelect, `setVisible`, `Destroy`, groups) and
+then build the entire `example.lua` on top:
+
+```
+lua5.3 smoke.lua                 # -> CHECKS OK / SMOKE OK
+```
+
+No Lua interpreter on the machine? `runner.py` runs the exact same smoke
+suite through an embedded Lua VM (needs `pip install lupa`):
+
+```
+python3 runner.py                # -> PARSE OK / CHECKS OK: 11 / SMOKE OK
+```
+
+Syntax checking alone does not prove a Roblox script runs — but a mock run
+catches the whole class of "valid syntax, nil at runtime" loading failures
+before they ever reach an executor.
+
 It also warns when a Lua keyword is used as a table key or dot-accessed — the bug
 class that `TweenService`'s `Enum.EasingDirection.In` invites (`Anim.Dir.in` is
 illegal Lua; the key is `inward`).
-
-Syntax checking alone does not prove a Roblox script runs. A file can pass the
-parser and still throw on load from an invalid property name, a non-creatable
-class, or a `local` captured before it was assigned. Test in a live environment.
 
 ---
 
