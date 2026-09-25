@@ -8,6 +8,22 @@ against — the entire library is ~11,000 lines of Lua, currently **Gen 1.3.0**.
 
 ---
 
+## Preview
+
+The notification stack (design B), rendered from the real design tokens —
+gradient ring, glowing icon halo, arrival sheen, action buttons, stacking and
+the draining progress bar:
+
+![NC notifications — animated preview](preview/notifications.gif)
+
+Want to poke at it instead of watch it? Open
+[`preview/index.html`](preview/index.html) in any browser for the **interactive
+playground**: fire each type, toggle action buttons, hover a card to pause its
+timer. (Push the `preview/` folder together with this README so the GIF and
+playground resolve on GitHub.)
+
+---
+
 ## New here? Start in three steps
 
 You need an **executor** (the program that runs Lua inside Roblox). Any popular
@@ -855,14 +871,21 @@ the config system.
 
 ## Notifications
 
+*See the animated preview at the top of this README, or the interactive
+playground in `preview/index.html`.*
+
 ```lua
 NC:Notify({ Title = "Success", Content = "Configuration saved", Duration = 3 })
 
 NC:Notify({
-    Title    = "Failed",
-    Content  = "Could not reach the server",
-    Type     = "error",
-    Duration = 4,
+    Title    = "Update ready",
+    Content  = "NC 1.4 redesign is available.",
+    Type     = "success",
+    Duration = 5,
+    Buttons  = {
+        { Name = "View", Callback = function() print("opened") end },
+        { Name = "Later" },
+    },
 })
 ```
 
@@ -872,9 +895,12 @@ NC:Notify({
 | `Content`  | string | —        | Body text.                             |
 | `Type`     | string | `"info"` | `success`, `info`, `warning`, `error`. |
 | `Duration` | number | `3`      | Seconds on screen.                     |
+| `Buttons`  | table  | —        | Action pills; the first is the accent primary. Pressing one runs its `Callback` and dismisses. |
 
-Each type has its own icon, accent colour and draining progress bar. Click to
-dismiss early. `NC:Toast(props)` is an alias.
+Cards stack in the bottom-right corner (newest hugging the corner) with a
+gradient border, top light and arrival sheen. Each type has its own icon halo,
+accent colour and draining progress bar. **Hovering a card pauses its timer**;
+click the body or × to dismiss early. `NC:Toast(props)` is an alias.
 
 **Stack cap.** At most `Theme.NotifyCap` cards sit on screen at once (default
 `4`). Older ones park off-screen and slide in as newer ones expire. Set the cap to
